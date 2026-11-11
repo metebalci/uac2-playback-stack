@@ -14,5 +14,7 @@ build/
 /examples/nucleo_h7s3l8/
 /tests/test_example_cn2_h7s3.c
 /tests/test_example_cn2off_h7s3.c
+/tests/test_example_bpc1_h7s3.c
+/tests/test_example_player_bpc1_h7s3.c
 /tests/test_example_player_h7s3.c
 /tests/test_example_supply_h7s3.c
