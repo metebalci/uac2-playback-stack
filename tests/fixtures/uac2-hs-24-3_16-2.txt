@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mete Balci
+# High-speed configuration descriptor of a UAC2 sink whose streaming
+# alternate settings carry the formats 24/3 and 16/2 (bit resolution/subslot
+# size in bytes), in alternate-setting order. One descriptor per line,
+# in hex, wTotalLength bytes in all.
+# The class-specific data endpoint descriptors (08 25 01 ...) carry
+# bLockDelayUnits 0 and wLockDelay 0: UAC2 4.10.1.2 (p. 87) requires zero
+# for an asynchronous endpoint.
+09 02 bb 00 02 01 00 80 32
+08 0b 00 02 01 00 20 00
+09 04 00 00 00 01 01 20 00
+09 24 01 00 02 08 2e 00 00
+08 24 0a 04 03 07 00 00
+11 24 02 01 01 01 00 04 02 03 00 00 00 00 00 00 00
+0c 24 03 03 01 03 00 01 04 00 00 00
+09 04 01 00 00 01 02 20 00
+09 04 01 01 02 01 02 20 00
+10 24 01 01 00 01 01 00 00 00 02 03 00 00 00 00
+06 24 02 01 03 18
+07 05 01 05 46 02 01
+08 25 01 00 00 00 00 00
+07 05 81 11 04 00 04
+09 04 01 02 02 01 02 20 00
+10 24 01 01 00 01 01 00 00 00 02 03 00 00 00 00
+06 24 02 01 02 10
+07 05 01 05 84 01 01
+08 25 01 00 00 00 00 00
+07 05 81 11 04 00 04

@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mete Balci
+# High-speed configuration descriptor of a composite device: a HID
+# interface 0 (USB HID 1.11: its HID descriptor and an interrupt IN
+# endpoint, EP2 IN), then a UAC2 sink whose IAD bounds interfaces 1
+# (AudioControl) and 2 (AudioStreaming, one alternate setting of the
+# format 24/3, as uac2-hs-24-3.txt). One descriptor per line, in hex,
+# wTotalLength bytes in all.
+09 02 9f 00 03 01 00 80 32
+09 04 00 00 01 03 00 00 00
+09 21 11 01 00 01 22 1c 00
+07 05 82 03 08 00 04
+08 0b 01 02 01 00 20 00
+09 04 01 00 00 01 01 20 00
+09 24 01 00 02 08 2e 00 00
+08 24 0a 04 03 07 00 00
+11 24 02 01 01 01 00 04 02 03 00 00 00 00 00 00 00
+0c 24 03 03 01 03 00 01 04 00 00 00
+09 04 02 00 00 01 02 20 00
+09 04 02 01 02 01 02 20 00
+10 24 01 01 00 01 01 00 00 00 02 03 00 00 00 00
+06 24 02 01 03 18
+07 05 01 05 46 02 01
+08 25 01 00 00 00 00 00
+07 05 81 11 04 00 04

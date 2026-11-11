@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mete Balci
+# The minimal FS configuration of the same UAC2 sink: the audio function
+# with its AudioControl interface only, no AudioStreaming interface (UAC2
+# 3.16.2: zero or more), and so no clock or terminals. The class-specific
+# header's wTotalLength counts the header alone (UAC2 4.7.2, Table 4-5).
+# One descriptor per line, in hex, wTotalLength bytes in all.
+09 02 23 00 01 01 00 80 32
+08 0b 00 01 01 00 20 00
+09 04 00 00 00 01 01 20 00
+09 24 01 00 02 08 09 00 00

@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mete Balci
+# A configuration that is no audio device, after the unsupported device of
+# the OTG and EH Compliance Plan (7.3.6): an OTG descriptor (bmAttributes
+# SRP and HNP, bcdOTG 2.00) and nine vendor-specific interfaces without
+# endpoints, bMaxPower 50 (100 mA). One descriptor per line, in hex,
+# wTotalLength bytes in all.
+09 02 5f 00 09 01 00 80 32
+05 09 03 00 02
+09 04 00 00 00 ff 00 00 00
+09 04 01 00 00 ff 00 00 00
+09 04 02 00 00 ff 00 00 00
+09 04 03 00 00 ff 00 00 00
+09 04 04 00 00 ff 00 00 00
+09 04 05 00 00 ff 00 00 00
+09 04 06 00 00 ff 00 00 00
+09 04 07 00 00 ff 00 00 00
+09 04 08 00 00 ff 00 00 00

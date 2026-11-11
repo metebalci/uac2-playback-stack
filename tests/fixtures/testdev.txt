@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mete Balci
+# The configuration of a test device (VID 0x1A0A) for the host tests: one
+# configuration, bConfigurationValue 1, bus-powered, bMaxPower 50 (100 mA),
+# one vendor-specific interface without endpoints; no audio function. One
+# descriptor per line, in hex, wTotalLength bytes in all.
+09 02 12 00 01 01 00 80 32
+09 04 00 00 00 ff 00 00 00
