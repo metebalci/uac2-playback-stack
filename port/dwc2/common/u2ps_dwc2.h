@@ -59,11 +59,16 @@
 bool u2ps_dwc2_cycles_start(void);
 
 /* DWT_CYCCNT (Armv7-M and Armv8-M Architecture Reference Manuals, "DWT"),
- * inline: the packet path reads it */
+ * inline: the packet path reads it. The PC test of the device port's
+ * handler (U2PS_DWC2_PC_TEST) gives its own. */
+#if defined(U2PS_DWC2_PC_TEST)
+uint32_t u2ps_dwc2_cycles(void);
+#else
 static inline uint32_t u2ps_dwc2_cycles(void)
 {
   return *(volatile uint32_t *)0xE0001004u;
 }
+#endif
 
 /* Spins until (reg & mask) == value, for at most 'us' microseconds.
  * Returns false on the timeout. */

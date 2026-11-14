@@ -196,6 +196,18 @@ target_include_directories(u2ps_dwc2_iso_old_rule PUBLIC ../port/dwc2/dcd)
 target_compile_definitions(u2ps_dwc2_iso_old_rule PRIVATE U2PS_DWC2_OLD_RULE=1)
 target_link_libraries(u2ps_dwc2_iso_old_rule PUBLIC u2ps_common)
 u2ps_test(test_dwc2_old_rule LIBS u2ps_dwc2_iso_old_rule)
+# The DWC2 device port's interrupt handler (u2ps_dwc2_dcd.c, an ARM source)
+# against a register model (fake_regs.h), built for the STM32U5A5: the
+# order of the data endpoint's XFRC, INCOMPISOOUT and EOPF
+u2ps_test(test_dwc2_dcd EXTRA ../port/dwc2/dcd/u2ps_dwc2_dcd.c ../port/dwc2/dcd/u2ps_dwc2_iso.c
+  LIBS u2ps_common)
+target_include_directories(test_dwc2_dcd BEFORE PRIVATE ../port/dwc2 ../port/dwc2/common
+                           ../port/dwc2/dcd ../device)
+target_compile_options(test_dwc2_dcd PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/fake_regs.h)
+target_compile_definitions(test_dwc2_dcd PRIVATE U2PS_DWC2_PC_TEST=1 U2PS_CHIP_STM32U5A5=1
+                           U2PS_DWC2_HSE_HZ=16000000
+                           U2PS_DWC2_CORE_HZ=160000000u U2PS_ISO_OUT_MPS_MAX=1024u
+                           U2PS_ISO_OUT_COUNT_MAX=16u)
 endif()
 
 if(U2PS_HOST)

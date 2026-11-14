@@ -51,8 +51,15 @@
 #define U2PS_DPORT_ISO_OUT_MIN 2u
 
 /* on_packet's microframe numbers are exact: the packet's microframe P comes
- * from EONUM and FNSOF read at its completion. A completion handled two or
- * more microframes late gives P+2 and places the hole one packet early. */
+ * from EONUM and FNSOF read at its completion. Exceptions, each rare: a
+ * completion handled 2k or 2k + 1 microframes late (k of 1 or more) gives
+ * P + 2k, two or more microframes off, and places the hole one packet
+ * early, as in 0.1.0; and in a gap, a parity that the follow writes while
+ * the host's packet is on the wire (NAKSTS reads 0 then; whether a packet
+ * is on the wire at the EOPF point is not measured), or in a pass served
+ * after the next SOF that the port does not find as such (a known limit,
+ * README), stamps that packet a microframe off (u2ps_dwc2_iso.h,
+ * u2ps_dwc2_out_incomplete). */
 #define U2PS_DPORT_UFRAME_EXACT 1
 
 /* EP0 data stages have no limit below a 16-bit length: the port splits each

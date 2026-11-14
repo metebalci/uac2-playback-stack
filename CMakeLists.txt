@@ -15,7 +15,7 @@
 #   the DWC2 host port on a DWC2 chip.
 
 cmake_minimum_required(VERSION 3.22)
-project(u2ps VERSION 0.1.0 LANGUAGES C)
+project(u2ps VERSION 0.1.1 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)

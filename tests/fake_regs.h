@@ -2,12 +2,13 @@
  * Copyright (c) 2026 Mete Balci
  *
  * fake_regs.h: register access of the DWC2 start-up code
- * (port/dwc2/common/u2ps_dwc2_phy.c) redirected to a register model, for
- * the PC test test_dwc2_phy.c. The test's build includes it ahead of every
- * source (-include), so u2ps_dwc2_regs.h keeps these definitions of
- * U2PS_DWC2_R32 and U2PS_DWC2_R16. Each access first calls the model with
- * its address and width; the access itself then goes to the model's
- * storage, so the model sees a write at the next access.
+ * (port/dwc2/common/u2ps_dwc2_phy.c) and of the DWC2 device port
+ * (port/dwc2/dcd/u2ps_dwc2_dcd.c) redirected to a register model, for the
+ * PC tests test_dwc2_phy.c and test_dwc2_dcd.c. The test's build
+ * includes it ahead of every source (-include), so u2ps_dwc2_regs.h keeps
+ * these definitions of U2PS_DWC2_R32 and U2PS_DWC2_R16. Each access first
+ * calls the model with its address and width; the access itself then goes
+ * to the model's storage, so the model sees a write at the next access.
  */
 #ifndef FAKE_REGS_H
 #define FAKE_REGS_H

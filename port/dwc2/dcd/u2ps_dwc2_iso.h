@@ -196,6 +196,10 @@ u2ps_dwc2_bnext_t u2ps_dwc2_bnext(u2ps_uframe_t p, u2ps_uframe_t now);
  *      step 3 returned. A reserve packet (buf U2PS_DWC2_NO_BUF, arm_buf
  *      set) has no upcall; it is data for the feedback's rule
  *      (u2ps_dwc2_fb_data).
+ * At INCOMPISOOUT, served after the data endpoint's XFRC and EPDISD of the
+ * same pass: u2ps_dwc2_out_incomplete(), and if it returns true, the
+ * parity written to OTG_DOEPCTLx (SODDFRM or SEVNFRM only), then
+ * u2ps_dwc2_out_eopf_after(), and EOPF unmasked for the follow.
  * At u2ps_dport_release(), in any context: u2ps_dwc2_out_release(), and no
  * register write, since a buffer is always armed and a freed one is armed
  * at the next completion.
@@ -223,8 +227,10 @@ typedef struct {
   uint8_t state;         /* u2ps_dwc2_out_state_t */
   bool started;          /* a packet has come since the open */
   bool armed_odd;        /* the parity the armed buffer was armed for */
-  bool following;        /* the parity follows the bus until the first XFRC */
+  bool following;        /* the parity follows the bus until the next XFRC */
   u2ps_uframe_t follow_fn; /* microframe of the last follow's EOPF */
+  bool gap_seen;         /* an INCOMPISOOUT of the armed parity since the last XFRC */
+  u2ps_uframe_t gap_fn;  /* its microframe */
   uint16_t count;        /* buffers of the stream */
   uint16_t head;         /* the oldest held buffer */
   uint16_t held;         /* packets delivered and not released */
@@ -242,7 +248,13 @@ typedef struct {
   uint32_t errors;           /* states the hardware cannot produce, invalid packets, bad releases */
   uint32_t close_drops;      /* packets that landed during a close, dropped */
   uint32_t follows;          /* parity writes of the follow (u2ps_dwc2_out_eopf) */
-  uint32_t follow_late;      /* of those, written once their microframe had begun */
+  uint32_t follow_late;      /* follow writes that landed once their microframe had begun,
+                                EOPF passes of a follow late or skipped, and gap evidence
+                                not two microframes apart: a packet may have been lost */
+  uint32_t gap_follows;      /* follows started in a gap (u2ps_dwc2_out_incomplete) */
+  uint32_t incomp_other;     /* INCOMPISOOUT of the other parity, idle: nothing done */
+  uint32_t gap_cleared;      /* gap evidence that an XFRC (completion or drop) cleared */
+  uint32_t gap_own;          /* of those, the XFRC of the evidence's own microframe */
 } u2ps_dwc2_out_t;
 
 /* One completed packet and what to report before it */
@@ -258,35 +270,163 @@ typedef struct {
 /* Opens a stream of 'count' buffers (at least U2PS_DWC2_OUT_RESERVE + 1,
  * 2) and arms buffer 0 for parity(now + 1), with now from FNSOF read
  * immediately before the OTG_DOEPCTLx write; the parity then follows the
- * bus until the first packet (u2ps_dwc2_out_eopf). Returns false, with
- * nothing armed, if count is lower. The counters are kept: zero the
- * struct once, before the first open. */
+ * bus until the first packet (u2ps_dwc2_out_eopf), and again in a gap
+ * after it (u2ps_dwc2_out_incomplete). Returns false, with nothing armed, if
+ * count is lower. The counters are kept: zero the struct once, before the
+ * first open. */
 bool u2ps_dwc2_out_open(u2ps_dwc2_out_t *o, uint16_t count, uint32_t fnsof, bool *odd);
 
 /* The data endpoint's parity follows the bus from the open to the first
+ * packet, and from a gap's start (u2ps_dwc2_out_incomplete) to the next
  * packet, as the feedback endpoint's does to the first poll
  * (u2ps_dwc2_fb_eopf): the core receives only in microframes of the armed
  * parity (RM0456 73.15.6, p. 3445), so a parity guessed once at the open
- * would lose a first packet in a microframe of the other one. At each EOPF
- * while the buffer is armed and no XFRC has come since the open, with
- * fnsof read at the EOPF: returns true and parity(now + 1) in *odd, which
- * the register layer writes (SODDFRM or SEVNFRM) and with which the
- * packet's P is then taken. False, and the follow ends, at the first XFRC
- * (completion or drop) and in a close; false also while nothing is armed,
- * and with following false (the register layer clears it to turn the
- * follow off). The follow has no time limit, as the feedback endpoint's
- * has none: however late the host sends the first packet, a follow that
- * ended before it would leave a guessed parity. It costs one EOPF pass of
- * the handler per microframe until the first packet (the cycles of that
- * pass are still to be measured; U2PS_DWC2_PASS_EOPF in the pass
- * profile). */
+ * would lose a first packet in a microframe of the other one. At each
+ * EOPF while the buffer is armed and no XFRC has come since the follow
+ * began, with fnsof read at the EOPF:
+ * - true, and parity(now + 1) in *odd, which the register layer writes
+ *   (SODDFRM or SEVNFRM) and with which the packet's P is then taken; the
+ *   pass becomes the reference of the next;
+ * - false, writing nothing, and the follow goes on, for a pass more than
+ *   one microframe after the reference (a pass skipped, or this one late,
+ *   so probably early in its microframe, where a write could land before
+ *   or under that microframe's packet): it counts in follow_late, keeps
+ *   the parity armed, and becomes the reference. A pass served after the
+ *   next SOF right after it is then taken for a timely one (a known
+ *   limit, README);
+ * - false, and the follow ends, at the next XFRC (completion or drop) and
+ *   in a close; false also while nothing is armed, and with following
+ *   false (the register layer clears it to turn the follow off).
+ * The register layer skips the write while EPENA is clear or NAKSTS set
+ * (a packet received, still to complete with the parity it came in,
+ * which its P is taken with), and in the pass that started the follow.
+ * The follow has no time limit, as the feedback endpoint's has none:
+ * however late the host sends the first packet, a follow that ended
+ * before it would leave a guessed parity. Measured on the NUCLEO-U5A5ZJ-Q
+ * from an open: the first packet was lost in 0 of 50 opens at 192 kHz
+ * with it and in 25 of 50 without it (0 of 10 and 5 of 10 at 768 kHz). It
+ * costs one EOPF pass of the handler per microframe until the packet
+ * (U2PS_DWC2_PASS_EOPF in the pass profile; in a gap's follow, with
+ * INCOMPISOOUT in the same pass, 288 cycles on the STM32F723 and 266 on
+ * the STM32U5G9, measured by bit-perfect-checker on 2026-11-12). */
 bool u2ps_dwc2_out_eopf(u2ps_dwc2_out_t *o, uint32_t fnsof, bool *odd);
 
-/* After that write, with fnsof read right after it: a write that lands
- * once the microframe it was meant for has begun (FNSOF no longer the
- * EOPF's) may have lost a first packet in that microframe; it counts in
- * follow_late, so the loss is not silent. */
+/* After that write, or the one of u2ps_dwc2_out_incomplete(), with fnsof
+ * read right after it: a write that lands once the microframe it was meant
+ * for has begun (FNSOF no longer the one read before it) may have lost a
+ * packet in that microframe; it counts in follow_late, so the loss is not
+ * silent. */
 void u2ps_dwc2_out_eopf_after(u2ps_dwc2_out_t *o, uint32_t fnsof);
+
+/* After the first packet, the parity follows the bus again in a gap of
+ * the host of three or more microframes, once INCOMPISOOUT (OTG_GINTSTS
+ * bit 21) has shown the gap. Without it, the parity armed after the last
+ * packet stays through the gap, and a host that resumes in a microframe of
+ * the other parity loses that packet without a signal (release 0.1.0). A
+ * gap of exactly two needs no write: the next microframe of the armed
+ * parity is the host's.
+ * - The core raises INCOMPISOOUT with EOPF when an isochronous OUT
+ *   endpoint has not completed its transfer in the current microframe
+ *   (RM0456 73.14.7, p. 3334; RM0431 32.15.6): no packet came, one was
+ *   dropped (Rx FIFO full, CRC error, corrupted token), or the packet's
+ *   data has not yet left the Rx FIFO (RM0456 73.15.6, p. 3446-3447;
+ *   RM0431 32.16.6, "Incomplete isochronous OUT data transfers"). A packet
+ *   that completes late raises it too: measured on DWC2 at 705.6 and
+ *   768 kHz with large packets, 0.01 to 0.03 % of the packets completed
+ *   117 to 121 us into their own microframe, a range around the EOPF point
+ *   (PFIVL 95 %, 118.75 us), and their re-arm ran after the next SOF.
+ * - INCOMPISOOUT comes only in a microframe of the armed parity: the
+ *   manuals' condition (EONUM = FNSOF[0] and EPENA, RM0456 p. 3447,
+ *   application step 3), and measured while the host streams:
+ *   bit-perfect-checker counted no INCOMPISOOUT inside 12 streams at 705.6
+ *   and 768 kHz on each of the STM32F723 and the STM32U5G9 (2026-11-12).
+ *   If a core raised it at every EOPF, the models of the tests show the
+ *   same results; incomp_other then counts one per packet.
+ * - A packet received is still to complete while NAKSTS is set: the core
+ *   sets the endpoint's NAK when PKTCNT reaches 0, as the packet is
+ *   written to the Rx FIFO (RM0456 73.15.6, p. 3444, internal data flow 2
+ *   to 7, which name isochronous packets, and p. 3445, isochronous flow 1;
+ *   RM0431 32.16.6; the SNAK text, RM0456 73.14.59, p. 3390, has it set
+ *   "on a transfer completed interrupt"). Measured with the NAKSTS
+ *   probe of the injection build (u2ps_dwc2_probe, u2ps_dwc2_dcd.h) by
+ *   bit-perfect-checker on the STM32F723 and the STM32U5G9 with a Linux
+ *   host, 2026-11-12: in every packet probed (4,800 at 192 kHz, 4,799 at
+ *   768 kHz, each core), NAKSTS was seen set before EPENA cleared, with a
+ *   lead of at most 103 to 105 cycles at 192 kHz and 281 to 283 at
+ *   768 kHz. Derived, not measured: since the lead grows with the packet's
+ *   size, NAK comes at the end of the packet's reception and NAKSTS reads
+ *   0 while the packet is on the wire (up to about 17 us); and with that
+ *   lead (1.3 to 1.8 us at 768 kHz), the packets completed 117 to 121 us
+ *   into their microframe entered the Rx FIFO about 115 to 120 us into
+ *   it, some after the EOPF point. Not measured: other DWC2 cores.
+ *   Inferred, not measured: that only the re-arm's CNAK clears it, and that a
+ *   corrupted packet, flushed from the Rx FIFO without decrementing PKTCNT
+ *   (p. 3444, flow 2), leaves it clear. If NAK came only at the XFRC, or
+ *   never, a miss followed by a packet completing late, and a late first
+ *   packet after a gap, would lose one packet more than 0.1.0 and stamp
+ *   one a microframe off; the register test's model table
+ *   (tests/test_dwc2_dcd.c, test_models) lists it per case.
+ * At INCOMPISOOUT, with idle true only if this pass served no XFRC of the
+ * endpoint and OTG_DOEPCTLx, read once, has EPENA set and NAKSTS clear,
+ * and with fnsof read then: the evidence is an idle INCOMPISOOUT in a
+ * microframe of the armed parity; the next one, two microframes later
+ * with no XFRC between, makes the gap sure. Then returns true and
+ * parity(now + 1) in *odd, which the register layer writes (SODDFRM or
+ * SEVNFRM), and the follow runs at EOPF (u2ps_dwc2_out_eopf) until the next
+ * XFRC, as from an open; it counts in gap_follows. Every XFRC and drop
+ * clears the evidence (counted in gap_cleared if there was some, and in
+ * gap_own if the XFRC is of the evidence's own microframe: a first
+ * evidence only, since a second one starts the follow), and so does an
+ * open. False, writing nothing, otherwise; then an idle INCOMPISOOUT of
+ * the other parity counts in incomp_other (a pass served after the SOF;
+ * or raised for another reason), and evidence other than two microframes
+ * apart (a pass skipped or late) in follow_late.
+ * Not followed, so lost as in release 0.1.0, with the hole one microframe
+ * longer than the host's gap:
+ * - the host's next packet after a single microframe without one, and
+ *   after a packet the core drops (CRC error): the endpoint stays armed for
+ *   that microframe's parity; after a drop the device misses two
+ *   microframes in which the host sent;
+ * - the host's next packet after a re-arm that came after its token
+ *   (B-next): two microframes are lost.
+ * Also lost, when an INCOMPISOOUT or EOPF pass of a gap comes after the
+ * next SOF: a late first evidence (counted in incomp_other) or second one
+ * (counted in incomp_other, then follow_late) delays the follow by two
+ * microframes or more, and a host that resumes in the delay, in a
+ * microframe of the other parity, loses that packet (a resume in the gap's
+ * fourth microframe, three after its first, when the first is late); a
+ * late or skipped EOPF pass of the follow leaves a microframe unarmed
+ * (counted in follow_late, at that pass or at the XFRC that ends the
+ * follow). A pass two microframes late can count nowhere: it is taken as
+ * the evidence of its own microframe.
+ * Not found (a known limit, README): a pass served after the next SOF,
+ * early in a microframe for an event of an earlier one, that the
+ * microframe number does not show: an EOPF pass right after a late one,
+ * which became its reference (repeated, while every pass is a microframe
+ * late, in every microframe); two INCOMPISOOUT passes of a gap's start,
+ * each two microframes late; the first EOPF pass after an open whose
+ * unmasking of EOPF came an odd number, three or more, of microframes
+ * after its arm. Such a pass writes a parity before or under the host's
+ * packet of its microframe.
+ * Not RM0456 p. 3447, application steps 5 and 6 (discard, EPDIS, EPDISD,
+ * enable again): an idle endpoint holds nothing to discard, and that
+ * recovery may miss the next microframe (step 6); only the parity of the
+ * armed buffer changes (inferred: neither manual restricts SODDFRM and
+ * SEVNFRM on an enabled endpoint, RM0456 73.14.59, p. 3389-3391; RM0431
+ * 32.15.61).
+ * Not measured: whether a packet of the current microframe is on the wire
+ * at its EOPF point, where every follow write reads NAKSTS. RM0456 says
+ * only that at INCOMPISOOUT "no active transfers remain in progress on
+ * this endpoint on the USB" (73.15.6, p. 3446-3447, "Incomplete
+ * isochronous OUT data transfers", internal data flow 2); USB 2.0 lets a
+ * host transmit later in the microframe (11.2.5, up to EOF1); and the
+ * derived arrival times above put some packets after the EOPF point.
+ * NAKSTS reads 0 while a packet is on the wire (derived), so a parity
+ * written then lands under it: stamped a microframe off, and the next
+ * packet lost. gap_own counts such a packet only when it is a gap's first
+ * evidence; a capture of the late packets on the bus would show whether
+ * it happens. */
+bool u2ps_dwc2_out_incomplete(u2ps_dwc2_out_t *o, uint32_t fnsof, bool idle, bool *odd);
 
 /* A close begins: from now on completions are dropped (counted in
  * close_drops) and releases never arm. Held packets may still be

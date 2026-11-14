@@ -933,6 +933,8 @@ static void test_out_follow(void)
 
   /* Across the wrap of the microframe numbers */
   open_out(4, 0x3FFD, &odd);
+  CHECK(u2ps_dwc2_out_eopf(&out, uf(0x3FFE), &odd));
+  CHECK_EQ(odd, true); /* parity(0x3FFF) */
   CHECK(u2ps_dwc2_out_eopf(&out, uf(0x3FFF), &odd));
   CHECK_EQ(odd, false); /* parity(0x0000) */
   u2ps_dwc2_out_eopf_after(&out, uf(0x3FFF));
@@ -981,6 +983,677 @@ static void test_out_follow_late_packet(void)
       CHECK_EQ(out.follows, (uint32_t)after[i] - 1u);
     }
   }
+}
+
+/* ---- Gaps of the host: the parity at INCOMPISOOUT -------------------------- */
+
+/* A model of the core and of the register layer (u2ps_dwc2_dcd.c) around
+ * the logic, one microframe per step.
+ * The core:
+ * - receives the host's packet in microframe m only if the endpoint is
+ *   enabled, armed for parity(m) (EONUM = FNSOF[0]) and its NAK is clear;
+ *   a received packet sets NAK as it enters the Rx FIFO (PKTCNT reaches
+ *   0), and only the re-arm's CNAK clears it (RM0456 73.15.6, p. 3444,
+ *   internal data flow 2 and 3, and p. 3445, isochronous flow 1); a
+ *   corrupted packet (crc_next) is flushed unseen, leaves NAK clear and
+ *   the endpoint enabled (p. 3444, flow 2; p. 3446);
+ * - completes a received packet in its microframe (EPENA cleared, XFRC
+ *   set), or with late_next only after the EOPF point: then INCOMPISOOUT is
+ *   raised for it at that EOPF, with EPENA still set, and its XFRC comes at
+ *   the start of m + 1 (measured at 705.6 and 768 kHz: 0.01 to 0.03 % of
+ *   the packets complete 117 to 121 us into their microframe, against
+ *   PFIVL 95 %, 118.75 us); with same_pass the handler serves that
+ *   INCOMPISOOUT only in the pass of the XFRC, after it;
+ * - raises INCOMPISOOUT at an EOPF at which the endpoint is enabled, armed
+ *   for parity(m) and has not completed a packet, or still drains one; with
+ *   every_eopf, at every EOPF at which the endpoint is enabled;
+ * - latches XFRC, INCOMPISOOUT and EOPF while the handler cannot run (from
+ *   the EOPF of block_from to the start of block_until, before its token):
+ *   then one pass serves them all, reading FNSOF as that microframe.
+ * The pass, as irq_pass(): the data endpoint's XFRC first (complete with
+ * FNSOF read as now, re-arm with now), then INCOMPISOOUT (idle: EPENA set,
+ * NAKSTS clear, no XFRC served in this pass), then EOPF for a follow (no
+ * data write while NAKSTS is set, nor in the pass that started the
+ * follow). The app releases each packet
+ * at once unless it holds them all; in a gap of more than 400 microframes
+ * (U2PS_GAP_PAUSE) the device stack's tick takes the holes held back
+ * (u2ps_dport_report_holes) every 8 microframes. */
+typedef struct {
+  long m;                /* the current microframe */
+  /* The core */
+  bool enabled, odd;     /* EPENA and EONUM of the data endpoint */
+  bool xfrc;             /* OTG_DOEPINTx.XFRC pending */
+  bool nak;              /* OTG_DOEPCTLx.NAKSTS */
+  bool draining;         /* a received packet completes after this EOPF */
+  long rx_m;             /* the received packet's microframe */
+  bool incomp_bit, eopf_bit; /* OTG_GINTSTS, latched */
+  /* Switches */
+  bool late_next;        /* the next received packet completes after its EOPF */
+  bool same_pass;        /* ... and its INCOMPISOOUT is served with its XFRC */
+  bool every_eopf;       /* INCOMPISOOUT at every EOPF while enabled */
+  bool crc_next;         /* the next packet the host sends is corrupted */
+  long block_from, block_until;
+  bool late_arm;         /* the next re-arm comes in P + 1, after its token */
+  bool pending_arm;
+  bool hold;             /* the app holds every packet */
+  /* The register layer */
+  bool eopf_out;         /* EOPF unmasked for a follow */
+  bool incomp_on;        /* INCOMPISOOUT unmasked */
+  bool started;
+  long last_rx;
+  unsigned long sent, received, delivered, lost, corrupted, incomp, holes, stamps, passes;
+} bus_t;
+
+static bus_t bus;
+
+static void bus_open(long at, bool follow)
+{
+  bool odd;
+  open_out(16, at, &odd);
+  memset(&bus, 0, sizeof bus);
+  out.following = follow; /* as u2ps_dport_stream_open() */
+  bus.m = at + 1;
+  bus.enabled = true;
+  bus.odd = odd;
+  bus.eopf_out = follow;
+  bus.incomp_on = follow;
+  bus.block_from = bus.block_until = -1;
+}
+
+static void bus_arm(long now)
+{
+  u2ps_dwc2_bnext_t a;
+  bus.enabled = u2ps_dwc2_out_arm(&out, uf(now), &a);
+  if (bus.enabled)
+    bus.nak = false; /* EPENA with CNAK */
+  bus.odd = a.odd;
+  bus.holes += a.late;
+  if (!bus.hold && out.held > 0u)
+    u2ps_dwc2_out_release(&out, out.held);
+}
+
+static void bus_tail(void)
+{
+  u2ps_dwc2_out_packet_t t;
+  u2ps_dwc2_out_tail(&out, &t);
+  bus.holes += t.late + t.no_buffer + t.no_packet;
+}
+
+/* The register layer at INCOMPISOOUT (out_incomplete() of
+ * u2ps_dwc2_dcd.c) */
+static bool reg_incomplete(long fn, bool served)
+{
+  bool idle = !served && bus.enabled && !bus.nak;
+  bool odd;
+  if (u2ps_dwc2_out_incomplete(&out, uf(fn), idle, &odd)) {
+    bus.odd = odd;
+    u2ps_dwc2_out_eopf_after(&out, uf(fn));
+    bus.eopf_bit = false; /* eopf_set(true) clears it, then unmasks */
+    bus.eopf_out = true;
+    return true;
+  }
+  return false;
+}
+
+/* One pass of the handler, FNSOF read as fn */
+static void bus_pass(long fn)
+{
+  bool served = false, started = false;
+  bool odd;
+
+  bus.passes++;
+  if (bus.xfrc) {
+    u2ps_dwc2_out_packet_t r;
+    bus.xfrc = false;
+    served = true;
+    if (!u2ps_dwc2_out_complete(&out, uf(fn), false, &r))
+      CHECK(u2ps_dwc2_out_complete(&out, uf(fn), true, &r));
+    if (r.uframe != uf(bus.rx_m))
+      bus.stamps++;
+    if (r.buf != U2PS_DWC2_NO_BUF)
+      bus.delivered++;
+    bus.holes += r.late + r.no_buffer + r.no_packet;
+    if (bus.late_arm) {
+      bus.late_arm = false;
+      bus.pending_arm = true;
+    } else {
+      bus_arm(fn);
+    }
+  }
+  if (bus.incomp_bit && bus.incomp_on) {
+    bus.incomp_bit = false;
+    started = reg_incomplete(fn, served);
+  }
+  if (bus.eopf_bit && bus.eopf_out) {
+    bus.eopf_bit = false;
+    if (!out.following) {
+      bus.eopf_out = false; /* the follow ended at an XFRC */
+    } else if (bus.enabled && !bus.nak && !started && u2ps_dwc2_out_eopf(&out, uf(fn), &odd)) {
+      bus.odd = odd;
+      u2ps_dwc2_out_eopf_after(&out, uf(fn));
+    }
+  }
+}
+
+static bool bus_blocked(bool at_eopf)
+{
+  long m = bus.m;
+  return (m == bus.block_from && at_eopf) || (m > bus.block_from && m < bus.block_until);
+}
+
+static bool bus_irq(void)
+{
+  return bus.xfrc || (bus.incomp_bit && bus.incomp_on) || (bus.eopf_bit && bus.eopf_out);
+}
+
+/* One microframe; the host sends a packet in it if 'send' */
+static void bus_step(bool send)
+{
+  long m = bus.m;
+
+  /* After the SOF: a packet completing late, a blocked handler's pass */
+  if (bus.draining) {
+    bus.draining = false;
+    bus.enabled = false;
+    bus.xfrc = true;
+  }
+  if (!bus_blocked(false) && bus_irq())
+    bus_pass(m);
+  /* The token */
+  if (send) {
+    bus.sent++;
+    if (bus.crc_next) {
+      bus.crc_next = false;
+      bus.corrupted++;
+    } else if (bus.enabled && bus.odd == odd_of(m) && !bus.nak) {
+      bus.nak = true; /* PKTCNT 0: NAK set as the packet enters the Rx FIFO */
+      bus.received++;
+      bus.rx_m = m;
+      bus.started = true;
+      bus.last_rx = m;
+      if (bus.late_next) {
+        bus.late_next = false;
+        bus.draining = true;
+        if (bus.same_pass) {
+          bus.same_pass = false;
+          bus.block_from = m;
+          bus.block_until = m + 1;
+        }
+      } else {
+        bus.enabled = false;
+        bus.xfrc = true;
+      }
+    } else {
+      bus.lost++;
+    }
+  }
+  if (bus.pending_arm) {
+    bus.pending_arm = false;
+    bus_arm(m);
+  }
+  if (!bus_blocked(false) && bus_irq())
+    bus_pass(m);
+  /* The EOPF of m */
+  if (bus.draining || (bus.enabled && (bus.every_eopf || bus.odd == odd_of(m)))) {
+    bus.incomp++;
+    bus.incomp_bit = true;
+  }
+  bus.eopf_bit = true;
+  if (!bus_blocked(true) && bus_irq())
+    bus_pass(m);
+  /* The tick in a long gap */
+  if (bus.started && m - bus.last_rx > 400 && m % 8 == 0)
+    bus_tail();
+  bus.m = m + 1;
+}
+
+static void bus_send(long n)
+{
+  for (long i = 0; i < n; i++)
+    bus_step(true);
+}
+
+static void bus_quiet(long n)
+{
+  for (long i = 0; i < n; i++)
+    bus_step(false);
+}
+
+/* The host's first packet after a gap of g microframes, both parities of g,
+ * under and over the pause (400 microframes, 50 ms), at the lengths
+ * measured on the boards (20 to 200 ms) and past half the wrap: received
+ * in its own microframe, the hole the gap, once INCOMPISOOUT of the armed
+ * parity has come twice without a packet between (g of 3 or more). After
+ * a single skipped microframe (g = 1) the next packet is lost, as in
+ * release 0.1.0: the one INCOMPISOOUT of the gap cannot be told from that
+ * of a packet still completing. */
+static void test_out_gap_resume(void)
+{
+  static const long gaps[] = {1, 2, 3, 4, 5, 159, 160, 399, 400, 401, 402, 1599, 1600, 9000, 9001};
+  for (unsigned i = 0; i < sizeof gaps / sizeof gaps[0]; i++) {
+    for (long open_at = 1000; open_at <= 1001; open_at++) {
+      long g = gaps[i];
+      unsigned long lost = g == 1 ? 1u : 0u;
+      bus_open(open_at, true);
+      bus_send(50);
+      long last = bus.m - 1;
+      bus_quiet(g);
+      bus_send(1);
+      CHECK_EQ(bus.lost, lost);
+      if (g > 1)
+        CHECK_EQ(bus.last_rx, last + g + 1);
+      bus_send(49);
+      bus_tail();
+      CHECK_EQ(bus.lost, lost);
+      CHECK_EQ(bus.delivered, 100 - lost);
+      CHECK_EQ(bus.holes, (unsigned long)g + lost);
+      CHECK_EQ(bus.stamps, 0);
+      /* INCOMPISOOUT in the armed parity's microframes until the follow
+       * starts, then in each */
+      CHECK_EQ(bus.incomp, g >= 3 ? (unsigned long)g - 1u : 1u);
+      CHECK_EQ(out.gap_follows, g >= 3 ? 1u : 0u);
+      CHECK_EQ(out.follows, g >= 3 ? (uint32_t)g - 3u : 0u);
+      CHECK_EQ(out.follow_late, 0);
+      CHECK_EQ(out.errors, 0);
+    }
+  }
+}
+
+/* The host streams without a gap: nothing changes the parity, nothing is
+ * lost or stamped wrong, across the wrap of the microframe numbers; also
+ * with packets that complete after the EOPF point, served in their own
+ * pass or in the pass of their XFRC, with INCOMPISOOUT raised at every
+ * EOPF (every_eopf), and with a pass one microframe late, with and without
+ * every_eopf */
+static void test_out_gap_streaming(void)
+{
+  for (int v = 0; v < 7; v++) {
+    bus_open(0x3C00, true); /* 2,001 microframes: across 0x3FFF to 0x0000 */
+    bus.every_eopf = v >= 3 && v <= 5;
+    bus_send(1);
+    for (long i = 0; i < 2000; i++) {
+      if (i % 100 == 50) {
+        if (v == 1 || v == 4) {
+          bus.late_next = true;
+        } else if (v == 2) {
+          bus.late_next = true;
+          bus.same_pass = true;
+        } else if (v >= 5) {
+          /* the passes from this microframe's EOPF on, that of the next
+           * one's XFRC and, with every_eopf, of the INCOMPISOOUT raised at this
+           * EOPF, come at the start of the one after: one microframe late */
+          bus.block_from = bus.m;
+          bus.block_until = bus.m + 2;
+        }
+      }
+      bus_step(true);
+    }
+    bus_tail();
+    CHECK_EQ(bus.lost, 0);
+    CHECK_EQ(bus.delivered, 2001);
+    CHECK_EQ(bus.holes, 0);
+    CHECK_EQ(bus.stamps, 0);
+    CHECK_EQ(out.gap_follows, 0);
+    CHECK_EQ(out.follows, 0);
+    CHECK_EQ(out.errors, 0);
+    if (v == 0)
+      CHECK_EQ(bus.incomp, 0);
+    if (v == 1 || v == 2)
+      CHECK_EQ(bus.incomp, 20);
+  }
+
+  /* A re-arm in P + 1 after its token (the injection build) loses that
+   * packet and, as in 0.1.0 with B-next, the next one: the hole is 2 */
+  bus_open(0x3000, true);
+  bus_send(10);
+  bus.late_arm = true;
+  bus_send(10);
+  bus_tail();
+  CHECK_EQ(bus.lost, 2);
+  CHECK_EQ(bus.delivered, 18);
+  CHECK_EQ(bus.holes, 2);
+  CHECK_EQ(bus.stamps, 0);
+  CHECK_EQ(out.gap_follows, 0);
+  CHECK_EQ(out.errors, 0);
+
+  /* A corrupted packet: the core drops it and stays armed for its
+   * microframe's parity, so the next packet is lost too, as in 0.1.0 */
+  bus_open(0x3000, true);
+  bus_send(10);
+  bus.crc_next = true;
+  bus_send(10);
+  bus_tail();
+  CHECK_EQ(bus.corrupted, 1);
+  CHECK_EQ(bus.lost, 1);
+  CHECK_EQ(bus.delivered, 18);
+  CHECK_EQ(bus.holes, 2);
+  CHECK_EQ(bus.stamps, 0);
+  CHECK_EQ(out.gap_follows, 0);
+  CHECK_EQ(out.errors, 0);
+}
+
+/* One miss, then the next packet of the armed parity completes past its
+ * EOPF: its INCOMPISOOUT finds NAKSTS set, so it is no evidence of a gap,
+ * and the follow writes nothing under it. v 0: a gap of 2; v 1: a single
+ * skip and a packet lost to the other parity (lost as in 0.1.0); v 2: a
+ * corrupted packet and the next one lost (as in 0.1.0); v 3: a re-arm
+ * after the token (two lost, as in 0.1.0 with B-next); v 4: a gap of 30,
+ * whose first packet completes late while the follow runs */
+static void test_out_gap_false(void)
+{
+  static const unsigned long want_lost[] = {0, 1, 1, 2, 0};
+  static const unsigned long want_holes[] = {2, 2, 2, 2, 30};
+  for (int v = 0; v < 5; v++) {
+    for (int every_eopf = 0; every_eopf <= 1; every_eopf++) {
+      bus_open(6000, true);
+      bus.every_eopf = every_eopf != 0;
+      bus_send(20);
+      if (v == 0) {
+        bus_quiet(2);
+      } else if (v == 1) {
+        bus_quiet(1);
+        bus_send(1);
+      } else if (v == 2) {
+        bus.crc_next = true;
+        bus_send(2);
+      } else if (v == 3) {
+        bus.late_arm = true;
+        bus_send(3);
+      } else {
+        bus_quiet(30);
+      }
+      bus.late_next = true;
+      bus_send(20);
+      bus_tail();
+      CHECK_EQ(bus.lost, want_lost[v]);
+      CHECK_EQ(bus.stamps, 0);
+      CHECK_EQ(bus.holes, want_holes[v]);
+      CHECK_EQ(out.gap_follows, v == 4 ? 1u : 0u);
+      CHECK_EQ(out.errors, 0);
+    }
+  }
+}
+
+/* Late passes in a gap: the follow starts later and no packet is stamped
+ * wrong. A first evidence served one microframe late counts in
+ * incomp_other, evidence four apart and a skipped EOPF of the follow in
+ * follow_late; a first evidence served two microframes late, or a pass
+ * held for eight, is taken as the first evidence of a later microframe
+ * and counts nowhere (v 1, 4) */
+static void test_out_gap_late_pass(void)
+{
+  for (int v = 0; v < 5; v++) {
+    for (int every_eopf = 0; every_eopf <= 1; every_eopf++) {
+      bus_open(5000, true);
+      bus.every_eopf = every_eopf != 0;
+      bus_send(20);
+      long last = bus.m - 1;
+      if (v == 0) { /* the first INCOMPISOOUT served one microframe late */
+        bus.block_from = last + 1;
+        bus.block_until = last + 2;
+      } else if (v == 1) { /* ... two microframes late */
+        bus.block_from = last + 1;
+        bus.block_until = last + 3;
+      } else if (v == 2) { /* the second one served two microframes late */
+        bus.block_from = last + 3;
+        bus.block_until = last + 5;
+      } else if (v == 3) { /* an EOPF of the follow served two late */
+        bus.block_from = last + 8;
+        bus.block_until = last + 10;
+      } else { /* a pass blocked for eight microframes */
+        bus.block_from = last + 1;
+        bus.block_until = last + 9;
+      }
+      bus_quiet(30);
+      bus_send(20);
+      bus_tail();
+      CHECK_EQ(bus.lost, 0);
+      CHECK_EQ(bus.delivered, 40);
+      CHECK_EQ(bus.holes, 30);
+      CHECK_EQ(bus.stamps, 0);
+      CHECK_EQ(out.gap_follows, 1);
+      CHECK_EQ(out.errors, 0);
+      if (v == 0 && every_eopf == 0)
+        CHECK_EQ(out.incomp_other, 1); /* served after the SOF */
+      if (v == 2 || v == 3)
+        CHECK(out.follow_late >= 1);   /* evidence 4 apart; an EOPF skipped */
+      if (v == 1 || v == 4)
+        CHECK_EQ(out.follow_late, 0);  /* taken as the first evidence: unseen */
+    }
+  }
+
+  /* The first evidence served after the SOF, and the host resuming right
+   * after the next: the follow has not started, and that packet is lost
+   * (counted in incomp_other only) */
+  bus_open(5000, true);
+  bus_send(20);
+  long last = bus.m - 1;
+  bus.block_from = last + 1;
+  bus.block_until = last + 2;
+  bus_quiet(3);
+  bus_send(10);
+  bus_tail();
+  CHECK_EQ(bus.lost, 1);
+  CHECK_EQ(bus.holes, 4);
+  CHECK_EQ(bus.stamps, 0);
+  CHECK_EQ(out.incomp_other, 1);
+  CHECK_EQ(out.gap_follows, 0);
+}
+
+/* A fresh open: the follow from the open takes the first packet in either
+ * parity, and INCOMPISOOUT starts no gap follow before it; with the follow
+ * mode off (INCOMPISOOUT masked as well) the parity guessed at the open
+ * stays until the first packet (0.1.0 had the follow from the open), and
+ * the parity armed after a packet through a gap, as in 0.1.0 */
+static void test_out_gap_open(void)
+{
+  static const long first[] = {1, 2, 3, 4, 1920, 1921};
+  for (unsigned i = 0; i < sizeof first / sizeof first[0]; i++) {
+    for (long open_at = 3000; open_at <= 3001; open_at++) {
+      bus_open(open_at, true);
+      bus_quiet(first[i] - 1);
+      bus_send(10);
+      bus_tail();
+      CHECK_EQ(bus.lost, 0);
+      CHECK_EQ(bus.delivered, 10);
+      CHECK_EQ(bus.holes, 0);
+      CHECK_EQ(bus.stamps, 0);
+      CHECK_EQ(out.gap_follows, 0);
+      CHECK_EQ(out.follows, (uint32_t)first[i] - 1u);
+      CHECK_EQ(out.errors, 0);
+    }
+  }
+  unsigned long lost = 0;
+  for (long open_at = 3000; open_at <= 3001; open_at++) {
+    for (long q = 0; q <= 1; q++) {
+      bus_open(open_at, false);
+      bus_quiet(q);
+      bus_send(10);
+      bus_quiet(5);
+      bus_send(10);
+      lost += bus.lost;
+      CHECK_EQ(out.gap_follows, 0);
+      CHECK_EQ(out.follows, 0);
+    }
+  }
+  /* the first packet of the two opens in the other parity, and the first
+   * after the gap of 5 in all four */
+  CHECK_EQ(lost, 2 + 4);
+}
+
+/* The app holds every packet it may while the host pauses: the reserve
+ * buffer stays armed through the gap, its parity follows the bus, and the
+ * first packet after the gap is a reserve packet in its own microframe */
+static void test_out_gap_reserve(void)
+{
+  for (long g = 7; g <= 8; g++) {
+    bus_open(4000, true);
+    bus.hold = true;
+    bus_send(15); /* the device stack holds 15 of 16 */
+    CHECK_EQ(out.held, 15);
+    bus_send(3);  /* reserve packets */
+    bus_quiet(g);
+    bus_send(3);
+    CHECK_EQ(bus.lost, 0);
+    CHECK_EQ(out.no_buffer, 6);
+    CHECK_EQ(out.no_packet, (uint32_t)g);
+    CHECK_EQ(out.gap_follows, 1);
+    bus.hold = false;
+    u2ps_dwc2_out_release(&out, out.held);
+    bus_send(1);
+    CHECK_EQ(bus.lost, 0);
+    CHECK_EQ(bus.delivered, 16);
+    CHECK_EQ(bus.holes, 6 + (unsigned long)g);
+    CHECK_EQ(bus.stamps, 0);
+    CHECK_EQ(out.errors, 0);
+  }
+}
+
+/* The decision at INCOMPISOOUT, case by case */
+static void test_out_incomplete(void)
+{
+  bool odd, armed;
+  u2ps_dwc2_bnext_t a;
+  u2ps_dwc2_out_packet_t r;
+
+  open_out(4, 99, &odd); /* armed for 100: even */
+  /* The follow from the open runs: nothing */
+  CHECK(!u2ps_dwc2_out_incomplete(&out, uf(100), true, &odd));
+  r = packet(100, 100, 100, &armed, &a); /* armed for 101: odd */
+  u2ps_dwc2_out_release(&out, 1);
+  /* Not idle (an XFRC pending or served): nothing, and no evidence */
+  CHECK(!u2ps_dwc2_out_incomplete(&out, uf(101), false, &odd));
+  CHECK(!out.gap_seen);
+  /* Not the armed parity: a pass served after the SOF, counted apart */
+  CHECK(!u2ps_dwc2_out_incomplete(&out, uf(102), true, &odd));
+  CHECK_EQ(out.incomp_other, 1);
+  CHECK_EQ(out.follow_late, 0);
+  CHECK(!out.gap_seen);
+  /* The first INCOMPISOOUT of the armed parity: evidence, no write */
+  CHECK(!u2ps_dwc2_out_incomplete(&out, uf(101), true, &odd));
+  CHECK(out.gap_seen);
+  CHECK_EQ(out.gap_fn, 101);
+  CHECK_EQ(out.armed_odd, true);
+  /* The same microframe again: nothing more */
+  CHECK(!u2ps_dwc2_out_incomplete(&out, uf(101), true, &odd));
+  CHECK_EQ(out.gap_fn, 101);
+  /* The next of the armed parity: the gap is sure, the follow starts */
+  CHECK(u2ps_dwc2_out_incomplete(&out, uf(103), true, &odd));
+  CHECK_EQ(odd, false); /* parity(104) */
+  CHECK_EQ(out.armed_odd, false);
+  CHECK(out.following);
+  CHECK(!out.gap_seen);
+  CHECK_EQ(out.gap_follows, 1);
+  CHECK_EQ(out.follow_fn, 103);
+  u2ps_dwc2_out_eopf_after(&out, uf(103));
+  CHECK_EQ(out.follow_late, 0);
+  CHECK_EQ(out.gap_cleared, 0);
+  /* While it runs, INCOMPISOOUT changes nothing; EOPF writes */
+  CHECK(!u2ps_dwc2_out_incomplete(&out, uf(104), true, &odd));
+  CHECK(u2ps_dwc2_out_eopf(&out, uf(104), &odd));
+  CHECK_EQ(odd, true); /* parity(105) */
+  /* An EOPF pass that skipped a microframe, served early in 106: counted,
+   * and no write; 106 is not armed (odd), 107 is */
+  CHECK(!u2ps_dwc2_out_eopf(&out, uf(106), &odd));
+  CHECK_EQ(out.follow_late, 1);
+  CHECK_EQ(out.armed_odd, true);
+  CHECK(out.following);
+  /* ... and the follow goes on from 106's EOPF */
+  CHECK(u2ps_dwc2_out_eopf(&out, uf(106), &odd));
+  CHECK_EQ(odd, true); /* parity(107) */
+  CHECK_EQ(out.follow_late, 1);
+  /* The packet of 107: P from the parity written, a hole of 6 */
+  r = packet(107, 107, 107, &armed, &a);
+  CHECK_EQ(r.no_packet, 6);
+  CHECK(!out.following);
+  CHECK(armed);
+  CHECK_EQ(out.errors, 0);
+
+  /* Evidence four microframes apart (a pass skipped): counted, and the
+   * evidence starts again there */
+  u2ps_dwc2_out_release(&out, 1); /* armed for 108: even */
+  CHECK(!u2ps_dwc2_out_incomplete(&out, uf(108), true, &odd));
+  CHECK(!u2ps_dwc2_out_incomplete(&out, uf(112), true, &odd));
+  CHECK_EQ(out.follow_late, 2);
+  CHECK_EQ(out.gap_fn, 112);
+  /* A completion clears the evidence, counted */
+  r = packet(114, 114, 114, &armed, &a); /* armed for 115 */
+  u2ps_dwc2_out_release(&out, 1);
+  CHECK(!out.gap_seen);
+  CHECK_EQ(out.gap_cleared, 1);
+  CHECK(!u2ps_dwc2_out_incomplete(&out, uf(115), true, &odd));
+  CHECK(out.gap_seen);
+  CHECK_EQ(u2ps_dwc2_out_drop(&out, uf(117)), 3);
+  CHECK(!out.gap_seen);
+  CHECK_EQ(out.gap_cleared, 2);
+  CHECK(u2ps_dwc2_out_arm(&out, uf(117), &a)); /* armed for 118 */
+
+  /* Across the wrap: evidence in 0x3FFE, the follow from 0x0000 */
+  open_out(4, 0x3FFC, &odd);
+  r = packet(0x3FFD, 0x3FFD, 0x3FFD, &armed, &a); /* armed for 0x3FFE */
+  u2ps_dwc2_out_release(&out, 1);
+  CHECK(!u2ps_dwc2_out_incomplete(&out, uf(0x3FFE), true, &odd));
+  CHECK(u2ps_dwc2_out_incomplete(&out, uf(0x0000), true, &odd));
+  CHECK_EQ(odd, true); /* parity(0x0001) */
+  r = packet(0x0001, 0x0001, 0x0001, &armed, &a);
+  CHECK_EQ(r.no_packet, 3);
+  CHECK_EQ(out.errors, 0);
+
+  /* Not while a completion awaits its arm decision, nor in a close, nor
+   * with no stream */
+  open_out(4, 199, &odd);
+  r = packet(200, 200, 200, &armed, &a);
+  CHECK(u2ps_dwc2_out_complete(&out, uf(201), false, &r));
+  CHECK_EQ(out.state, U2PS_DWC2_OUT_COMPLETED);
+  CHECK(!u2ps_dwc2_out_incomplete(&out, uf(201), true, &odd));
+  CHECK(!out.gap_seen);
+  CHECK(u2ps_dwc2_out_arm(&out, uf(201), &a)); /* armed for 202 */
+  CHECK(!u2ps_dwc2_out_incomplete(&out, uf(202), true, &odd));
+  CHECK(out.gap_seen);
+  u2ps_dwc2_out_closing(&out);
+  CHECK(!u2ps_dwc2_out_incomplete(&out, uf(204), true, &odd));
+  u2ps_dwc2_out_close(&out);
+  CHECK(!u2ps_dwc2_out_incomplete(&out, uf(204), true, &odd));
+  CHECK_EQ(out.gap_follows, 0);
+  CHECK_EQ(out.armed_odd, false);
+  /* An open clears the evidence */
+  CHECK(u2ps_dwc2_out_open(&out, 4, uf(300), &odd));
+  CHECK(!out.gap_seen);
+
+  /* Two late EOPF passes of a follow in a row: the first (served early in
+   * 406, the parity of 406 armed) writes nothing, nor does the second,
+   * early in 407: both count */
+  open_out(4, 399, &odd);
+  r = packet(400, 400, 400, &armed, &a); /* armed for 401 */
+  u2ps_dwc2_out_release(&out, 1);
+  CHECK(!u2ps_dwc2_out_incomplete(&out, uf(401), true, &odd));
+  CHECK(u2ps_dwc2_out_incomplete(&out, uf(403), true, &odd)); /* armed for 404 */
+  CHECK(u2ps_dwc2_out_eopf(&out, uf(404), &odd));             /* armed for 405 */
+  CHECK(!u2ps_dwc2_out_eopf(&out, uf(407), &odd)); /* EOPF 405, 406 missed */
+  CHECK_EQ(out.follow_late, 1);
+  CHECK_EQ(out.armed_odd, true); /* 407's parity stays armed */
+  CHECK(!u2ps_dwc2_out_eopf(&out, uf(408), &odd)); /* EOPF 407 missed too */
+  CHECK_EQ(out.follow_late, 2);
+  CHECK_EQ(out.armed_odd, true); /* 409's */
+  CHECK_EQ(out.follows, 1);
+
+  /* An XFRC in a close neither counts a follow's missed passes nor the
+   * evidence it clears */
+  open_out(4, 499, &odd);
+  r = packet(500, 500, 500, &armed, &a); /* armed for 501 */
+  u2ps_dwc2_out_release(&out, 1);
+  CHECK(!u2ps_dwc2_out_incomplete(&out, uf(501), true, &odd));
+  CHECK(out.gap_seen);
+  u2ps_dwc2_out_closing(&out);
+  CHECK(u2ps_dwc2_out_complete(&out, uf(505), false, &r));
+  CHECK(!out.gap_seen);
+  CHECK_EQ(out.gap_cleared, 0);
+  open_out(4, 599, &odd);
+  out.following = true;
+  out.follow_fn = 590;
+  u2ps_dwc2_out_closing(&out);
+  CHECK(u2ps_dwc2_out_complete(&out, uf(601), false, &r));
+  CHECK_EQ(out.follow_late, 0);
 }
 
 /* ---- Feedback IN endpoint -------------------------------------------------- */
@@ -1668,6 +2341,13 @@ int main(void)
   test_out_closing();
   test_out_follow();
   test_out_follow_late_packet();
+  test_out_incomplete();
+  test_out_gap_resume();
+  test_out_gap_streaming();
+  test_out_gap_late_pass();
+  test_out_gap_false();
+  test_out_gap_open();
+  test_out_gap_reserve();
   test_fb_limits();
   test_fb_first_poll();
   test_fb_follow_late_poll();

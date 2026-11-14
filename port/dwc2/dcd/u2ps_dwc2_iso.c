@@ -124,8 +124,29 @@ bool u2ps_dwc2_out_open(u2ps_dwc2_out_t *o, uint16_t count, uint32_t fnsof, bool
   *odd = o->armed_odd;
   o->following = true;
   o->follow_fn = fn14(fnsof);
+  o->gap_seen = false;
   o->state = U2PS_DWC2_OUT_ARMED;
   return true;
+}
+
+/* An XFRC (completion or drop) of the packet of microframe p, with the
+ * stream ARMED (armed) or not: the follow ends, and the gap evidence is
+ * cleared, with its counts */
+U2PS_FAST_TEXT static void xfrc_seen(u2ps_dwc2_out_t *o, u2ps_uframe_t p, bool armed)
+{
+  if (armed) {
+    /* The follow's last write was for a microframe before p - 1: EOPF
+     * passes were missed, and a packet in them may have been lost */
+    if (o->following && fwd(o->follow_fn, p) > 1u)
+      o->follow_late++;
+    if (o->gap_seen) {
+      o->gap_cleared++;
+      if (p == o->gap_fn)
+        o->gap_own++; /* the evidence was this packet's own INCOMPISOOUT */
+    }
+  }
+  o->following = false;
+  o->gap_seen = false;
 }
 
 U2PS_FAST_TEXT bool u2ps_dwc2_out_eopf(u2ps_dwc2_out_t *o, uint32_t fnsof, bool *odd)
@@ -134,9 +155,49 @@ U2PS_FAST_TEXT bool u2ps_dwc2_out_eopf(u2ps_dwc2_out_t *o, uint32_t fnsof, bool 
 
   if (!o->following || o->state != U2PS_DWC2_OUT_ARMED)
     return false;
+  if (fwd(o->follow_fn, fn) > 1u) {
+    /* A pass skipped, or this one late, so probably early in fn: write
+     * nothing, so as to change no parity under a packet of fn that comes
+     * after the register layer's NAKSTS read. If fn's parity is armed it
+     * stays so, and the follow goes on from the EOPF of fn; otherwise
+     * fn + 1's is armed. A packet in the microframes missed may have been
+     * lost. */
+    o->follow_late++;
+    o->follow_fn = o->armed_odd == parity(fn) ? u2ps_uframe_sub(fn, 1u) : fn;
+    return false;
+  }
   o->armed_odd = parity(u2ps_uframe_add(fn, 1u));
   o->follow_fn = fn;
   o->follows++;
+  *odd = o->armed_odd;
+  return true;
+}
+
+U2PS_FAST_TEXT bool u2ps_dwc2_out_incomplete(u2ps_dwc2_out_t *o, uint32_t fnsof, bool idle,
+                                            bool *odd)
+{
+  u2ps_uframe_t fn = fn14(fnsof);
+
+  if (!idle || o->following || o->state != U2PS_DWC2_OUT_ARMED)
+    return false;
+  if (o->armed_odd != parity(fn)) {
+    o->incomp_other++; /* served after the SOF, or not this endpoint's */
+    return false;
+  }
+  if (!o->gap_seen || fwd(o->gap_fn, fn) != 2u) {
+    /* The first evidence, or again after a pass skipped (counted) */
+    if (o->gap_seen && fwd(o->gap_fn, fn) != 0u)
+      o->follow_late++;
+    o->gap_seen = true;
+    o->gap_fn = fn;
+    return false;
+  }
+  /* No packet in two microframes of the armed parity: a gap */
+  o->gap_seen = false;
+  o->following = true;
+  o->armed_odd = parity(u2ps_uframe_add(fn, 1u));
+  o->follow_fn = fn;
+  o->gap_follows++;
   *odd = o->armed_odd;
   return true;
 }
@@ -164,9 +225,9 @@ U2PS_FAST_TEXT bool u2ps_dwc2_out_complete(u2ps_dwc2_out_t *o, uint32_t fnsof, b
   u2ps_uframe_t p = u2ps_dwc2_uframe(fnsof, o->armed_odd);
   bool resync = false;
 
-  o->following = false; /* the first XFRC: B-next takes over */
   r->uframe = p;
   if (o->state != U2PS_DWC2_OUT_ARMED) {
+    xfrc_seen(o, p, false);
     if (o->state == U2PS_DWC2_OUT_CLOSING)
       o->close_drops++;
     else
@@ -186,6 +247,7 @@ U2PS_FAST_TEXT bool u2ps_dwc2_out_complete(u2ps_dwc2_out_t *o, uint32_t fnsof, b
       resync = true;
     }
   }
+  xfrc_seen(o, p, true); /* the first XFRC: B-next takes over */
   uint32_t no_packet = 0;
   if (o->started && !resync) {
     /* The hole since the last packet, less what is reported or recorded */
@@ -229,7 +291,7 @@ U2PS_FAST_TEXT uint16_t u2ps_dwc2_out_drop(u2ps_dwc2_out_t *o, uint32_t fnsof)
 {
   u2ps_uframe_t p = u2ps_dwc2_uframe(fnsof, o->armed_odd);
 
-  o->following = false;
+  xfrc_seen(o, p, o->state == U2PS_DWC2_OUT_ARMED);
   if (o->state != U2PS_DWC2_OUT_ARMED) {
     if (o->state == U2PS_DWC2_OUT_CLOSING)
       o->close_drops++;

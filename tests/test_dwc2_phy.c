@@ -16,7 +16,10 @@
  * USBPHYCEN and OTGHSEN. Each failure returns its reason and touches
  * nothing after it.
  * STM32F723 (Cortex-M7): the same cycle counter start, before any RCC
- * access. STM32U5A5 (Cortex-M33): no lock access register, no check.
+ * access; with the HSE ready, the whole start: 0xF13 OR-ed into
+ * USBPHYC_TUNE (RM0431 33.4.2), keeping what was there, after the PLL1
+ * select and before PLL1_EN. STM32U5A5 (Cortex-M33): no lock access
+ * register, no check.
  *
  * The model: the DWT ignores writes of DWT_CTRL until DWT_LAR holds the
  * key (a locked Cortex-M7 DWT, inferred from reports); CYCCNT advances by
@@ -358,6 +361,41 @@ static void test_f723_cycles(void)
   CHECK_EQ(accesses(0x40023800u, 0x40023C00u), 0);
   CHECK_EQ(waits, 0);
 }
+
+/* The whole start with the HSE ready: the USBPHYC tuning OR-ed into
+ * USBPHYC_TUNE, 0xF13 (RM0431 33.4.2: INCURREN, INCURRINT, HSDRVDCCUR,
+ * HSDRVRFRED, HSDRVCHKITRM 0111), keeping what was there (the reset
+ * value 0x4, LFSCAPEN: 0xF17), written after the PLL1 select and before
+ * PLL1_EN */
+#define F7_PHYC_PLL1 0x40017C00u
+#define F7_PHYC_TUNE 0x40017C0Cu
+#define F7_PHYC_LDO  0x40017C18u
+static void test_f723_tune(void)
+{
+  /* the reset value; with SQLBYP and SHTCCTCLPROT; HSDRVDCCUR set and
+   * LFSCAPEN clear */
+  static const uint32_t pres[] = {0x00000004u, 0x00C00004u, 0x00C00010u};
+  for (unsigned k = 0; k < sizeof pres / sizeof pres[0]; k++) {
+    uint32_t pre = pres[k];
+    model_reset();
+    preset(F7_RCC_CR, 1u << 17); /* HSERDY */
+    preset(F7_PHYC_TUNE, pre);
+    preset(F7_PHYC_LDO, 1u << 1); /* LDO_STATUS: ready */
+    CHECK_EQ(u2ps_dwc2_phy_start(), U2PS_DWC2_OK);
+    flush();
+    CHECK_EQ(reg(F7_PHYC_TUNE), pre | 0x00000F13u);
+    CHECK_EQ(reg(F7_PHYC_PLL1) & 1u, 1u); /* PLL1_EN */
+    /* the select, the tuning, then the enable */
+    int sel = first(F7_PHYC_PLL1), tune = first(F7_PHYC_TUNE), en = last(F7_PHYC_PLL1);
+    CHECK(sel >= 0 && tune > sel && en > tune);
+    CHECK_EQ(last(F7_PHYC_TUNE) < en, 1);
+    CHECK_EQ(violations, 0);
+    /* A second start (a re-init) leaves the value as it is */
+    CHECK_EQ(u2ps_dwc2_phy_start(), U2PS_DWC2_OK);
+    flush();
+    CHECK_EQ(reg(F7_PHYC_TUNE), pre | 0x00000F13u);
+  }
+}
 #endif
 
 /* ---- STM32U5A5 ---------------------------------------------------------------- */
@@ -389,6 +427,7 @@ int main(void)
   test_h7s3_no_usb33();
 #elif defined(TEST_F723)
   test_f723_cycles();
+  test_f723_tune();
 #elif defined(TEST_U5A5)
   test_u5_cycles();
 #endif

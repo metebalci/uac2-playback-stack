@@ -76,9 +76,12 @@ typedef struct {
   uint32_t iisoixfr;      /* IISOIXFR interrupts while the feedback endpoint was open */
   uint32_t iiso_hist[8];  /* those with a poll expected, by (FNSOF - expected poll) mod 8 */
   uint32_t eopf;          /* EOPF interrupts (a parity following the bus) */
-  uint32_t out_follows;   /* the data endpoint's parity writes before its first packet */
-  uint32_t out_follow_late; /* of those, written once their microframe had begun: a first
-                               packet in it may have been lost */
+  uint32_t out_follows;   /* the data endpoint's parity writes at EOPF, from an open or a
+                             gap's start to the next packet */
+  uint32_t out_follow_late; /* follow writes that landed once their microframe had begun,
+                               EOPF passes of a follow that came late or were skipped, and
+                               gap evidence not two microframes apart (an INCOMPISOOUT pass
+                               skipped or late): a packet may have been lost */
   uint32_t fb_forced;     /* recoveries ended without their EPDISD (inferred fallback) */
   uint32_t fb_idle_recoveries; /* recoveries and switches not in fb_recoveries: no data flowed,
                                   or no poll followed */
@@ -107,6 +110,31 @@ typedef struct {
   uint32_t in_setups;     /* device-to-host SETUPs (XFRC with STPKTRX) */
   uint32_t in_setup_ittxfe; /* of those, with DIEPINT0.ITTXFE already set */
   uint32_t timeouts;      /* register waits that timed out */
+  /* Since 0.1.1 */
+  uint32_t incompisoout;  /* INCOMPISOOUT indications served while a stream was open (each
+                             a status bit seen in a pass, not a pass of its own): also those
+                             in a pass that served an XFRC (profiled as OUT), those of a
+                             follow's passes (profiled as EOPF) and those before a stream's
+                             first packet */
+  uint32_t out_gap_follows; /* follows started in a gap of the host after a packet: one per
+                               gap of three or more microframes, not one per write */
+  uint32_t incompisoout_other; /* idle INCOMPISOOUT, outside a follow, of the other parity
+                                  than the armed one: a pass served after the SOF, or the
+                                  core raising it for another reason; nothing written */
+  uint32_t out_gap_cleared; /* gap evidence (one idle INCOMPISOOUT of the armed parity) that
+                               an XFRC cleared: 0 in a stream in which the host sends in
+                               every microframe and every packet's NAKSTS reads 1 before its
+                               XFRC; a miss (skip, CRC drop, re-arm after the token) before
+                               a packet adds one */
+  uint32_t incomp_nak;    /* INCOMPISOOUT, not in a pass that served an XFRC, with EPENA and
+                             NAKSTS set: a packet received, waiting for its DMA */
+  uint32_t out_gap_own;   /* of out_gap_cleared, cleared by the XFRC of a packet of the
+                             evidence's own microframe: a packet still on the wire at the
+                             EOPF point, or a NAK that came late. A first evidence only: a
+                             packet taken as a second evidence starts the follow, and no
+                             evidence is left for its XFRC to clear */
+  uint32_t eonum_mismatch; /* INCOMPISOOUT that found OTG_DOEPCTLx.EONUM other than the
+                              parity the port armed (expected 0) */
 } u2ps_dwc2_dcd_diag_t;
 
 /* App, thread: a copy of the counters, taken with the vector masked */
@@ -122,9 +150,13 @@ void u2ps_dwc2_dcd_fb_start(u2ps_dwc2_fb_start_t *rec);
  *   first poll (u2ps_dwc2_iso.h); false: the parity guessed at the open
  *   stays until the switch rule changes it.
  * - out_follow: the data endpoint's parity follows the bus from the open
- *   to the first packet (u2ps_dwc2_out_eopf); false: the parity guessed at
- *   the open stays, and a first packet in a microframe of the other
- *   parity is lost.
+ *   to the first packet (u2ps_dwc2_out_eopf), and again in a gap of the
+ *   host of three or more microframes, from the third microframe of the
+ *   gap, once INCOMPISOOUT has shown it, to the next packet
+ *   (u2ps_dwc2_out_incomplete);
+ *   false: the parity guessed at the open stays, and so does the parity
+ *   armed after a packet through a gap, so that a first packet in a
+ *   microframe of the other parity is lost, as in release 0.1.0.
  * - iiso_window: IISOIXFR unmasked only around an expected poll; false:
  *   unmasked for the whole stream. */
 typedef struct {
@@ -169,9 +201,19 @@ typedef enum {
   U2PS_DWC2_PASS_OUT,       /* a data packet */
   U2PS_DWC2_PASS_IISO,      /* IISOIXFR without any of the above */
   U2PS_DWC2_PASS_EOPF,      /* EOPF without any of the above */
+  U2PS_DWC2_PASS_INCOMP,    /* INCOMPISOOUT without any of the above (since 0.1.1) */
   U2PS_DWC2_PASS_OTHER,
   U2PS_DWC2_PASS_KINDS
 } u2ps_dwc2_pass_t;
+
+/* Short names of the kinds, in the order of u2ps_dwc2_pass_t (the n-th
+ * name is that of kind n), for an initializer:
+ * static const char *const names[U2PS_DWC2_PASS_KINDS] = U2PS_DWC2_PASS_NAMES; */
+#define U2PS_DWC2_PASS_NAMES \
+  {"reset", "ep0_stop", "fb_flush", "setup", "out", "iiso", "eopf", "incomp", "other"}
+_Static_assert(sizeof((const char *const[])U2PS_DWC2_PASS_NAMES) / sizeof(const char *) ==
+                 U2PS_DWC2_PASS_KINDS,
+               "U2PS_DWC2_PASS_NAMES has one name per kind of u2ps_dwc2_pass_t");
 
 typedef struct {
   uint32_t n[U2PS_DWC2_PASS_KINDS];
@@ -181,6 +223,37 @@ typedef struct {
 
 /* A copy of the pass profile; clear = true restarts it */
 void u2ps_dwc2_passes_get(u2ps_dwc2_passes_t *p, bool clear);
+
+/* The NAKSTS probe (since 0.1.1): after every 'every'th re-arm of the data
+ * endpoint (0: off, the default), the handler polls OTG_DOEPCTLx until
+ * EPENA clears, that is until the next packet's completion, and records
+ * whether NAKSTS read 1 in a poll before the poll that saw EPENA clear:
+ * that NAK is seen before EPENA clears, which the port's gap evidence
+ * assumes for every packet (RM0456 73.15.6, p. 3444, internal data flow
+ * 3). It does not show when NAK was set. Measured by bit-perfect-checker
+ * on the STM32F723 and the STM32U5G9 with a Linux host, 2026-11-12: NAKSTS
+ * seen set before EPENA cleared in every packet probed, 4,800 at 192 kHz
+ * and 4,799 at 768 kHz on each, with a lead (nak_cycles_max) of up to 105
+ * and 283 cycles. Derived: since the lead grew with the packet's size,
+ * NAK comes at the end of reception. Run it on another core. Each probe
+ * holds the handler until that packet completes, up to about 125 us; its
+ * bound is a budget in DWT cycles, 250 us at the build's U2PS_DWC2_CORE_HZ
+ * (longer at a slower core clock). With every = 8000 (once a second at a
+ * packet per microframe) it takes about 0.01 % of the core, and the
+ * packet after the probed one completes in a later pass. The counters
+ * restart at each call. */
+typedef struct {
+  uint32_t every;          /* the setting */
+  uint32_t probes;         /* re-arms probed */
+  uint32_t nak_first;      /* packets whose NAKSTS read 1 while EPENA was still 1 */
+  uint32_t nak_never;      /* packets completed (EPENA 0) with NAKSTS never seen 1 before */
+  uint32_t nak_at_xfrc;    /* of all completed, NAKSTS 1 at the read that saw EPENA 0 */
+  uint32_t timeouts;       /* probes with no completion within two microframes */
+  uint32_t nak_cycles_max; /* longest time from NAKSTS seen to EPENA clear, DWT cycles */
+} u2ps_dwc2_probe_t;
+
+void u2ps_dwc2_probe(uint32_t every);
+void u2ps_dwc2_probe_get(u2ps_dwc2_probe_t *st);
 #endif
 
 #endif /* U2PS_DWC2_DCD_H */

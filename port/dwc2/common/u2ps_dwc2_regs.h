@@ -100,6 +100,7 @@
 
 /* USBPHYC (RM0431 33.4) */
 #define USBPHYC_PLL1 U2PS_DWC2_R32(U2PS_DWC2_USBPHYC_BASE + 0x000u)
+#define USBPHYC_TUNE U2PS_DWC2_R32(U2PS_DWC2_USBPHYC_BASE + 0x00Cu)
 #define USBPHYC_LDO  U2PS_DWC2_R32(U2PS_DWC2_USBPHYC_BASE + 0x018u)
 #define PLL1_SEL(v)        ((uint32_t)(v) << 1) /* 33.4.1 */
 #define PLL1_EN            (1u << 0)
@@ -107,7 +108,9 @@
  * 33.4.3, but the register's reset value there, 0x1 with STATUS 0, does
  * not fit that. ST's CMSIS device header stm32f723xx.h (cmsis_device_f7)
  * names the same bit USB_HS_PHYC_LDO_ENABLE, so the LDO is enabled by
- * setting it (to be checked on the board: LDO_STATUS after the write). */
+ * setting it. Seen on the STM32F723E-DISCO: the port's start waits for
+ * LDO_STATUS after the write and fails without it, and it has started the
+ * HS PHY in bit-perfect-checker's runs since 0.1.0. */
 #define LDO_ENABLE         (1u << 2)
 #define LDO_STATUS         (1u << 1)
 
@@ -289,6 +292,7 @@
 #define EPCTL_TXFNUM(n)  ((uint32_t)(n) << 22)
 #define EPCTL_STALL      (1u << 21)
 #define EPCTL_EPTYP_ISO  (0x1u << 18)
+#define EPCTL_NAKSTS     (1u << 17)
 #define EPCTL_EONUM      (1u << 16)
 #define EPCTL_USBAEP     (1u << 15)
 #define EPCTL_MPSIZ(m)   ((uint32_t)(m) & 0x7FFu)

@@ -120,9 +120,14 @@ u2ps_dwc2_err_t u2ps_dwc2_phy_start(void)
 #error "u2ps_dwc2_phy.c: U2PS_DWC2_HSE_HZ must be 12000000, 12500000, 16000000, 24000000 or 25000000 on the STM32F723, the references its USBPHYC PLL takes (RM0431 33.4.1): set -DU2PS_DWC2_HSE_HZ to the board's HSE, one of these"
 #endif
 
-/* Compiled, not yet run on a board. RM0431 gives no order, start-up time or
- * lock bit for the PHY; the order here is: clocks,
- * LDO and its ready bit, PLL, then a 2 ms wait for the PLL (inferred). */
+/* USBPHYC_TUNE (RM0431 33.4.2): INCURREN (bit 0), INCURRINT (1),
+ * HSDRVDCCUR (4), HSDRVRFRED (8), HSDRVCHKITRM[3:0] (12:9) = 0111 */
+#define PHYC_TUNE_VALUE 0x00000F13u
+
+/* RM0431 gives no order, start-up time or lock bit for the PHY; the order
+ * here is: clocks, LDO and its ready bit, the PLL's input selection, the
+ * PHY's tuning, the PLL's enable, then a 2 ms wait for the PLL
+ * (inferred). */
 u2ps_dwc2_err_t u2ps_dwc2_phy_start(void)
 {
   if (!u2ps_dwc2_cycles_start())
@@ -140,6 +145,20 @@ u2ps_dwc2_err_t u2ps_dwc2_phy_start(void)
   if (!u2ps_dwc2_wait_us(&USBPHYC_LDO, LDO_STATUS, LDO_STATUS, 10000u))
     return U2PS_DWC2_ERR_PHY;
   USBPHYC_PLL1 = PLL1_SEL(PHY_PLLSEL);
+  /* The HS PHY's tuning, OR-ed into USBPHYC_TUNE (RM0431 33.4.2):
+   * INCURREN and INCURRINT (a current boost of 2 mA), HSDRVDCCUR (the HS
+   * driver's DC level down by 5 to 7 mV), HSDRVRFRED (rise and fall time
+   * +20 %) and HSDRVCHKITRM = 0111 (HS driver current +10.92 %, for choke
+   * compensation). The value assumes the other bits as at reset: with the
+   * reset value's LFSCAPEN (0x4) the register reads 0xF17, and a field
+   * already set is OR-ed, not replaced. RM0431 recommends no value. 0xF13
+   * is the default of ST's STM32F7 HAL V1.3.3 (stm32f7xx_ll_usb.c), read
+   * there only to locate this hardware setting; nothing but the value is
+   * taken from it. The trim compensates a common-mode choke on D+ and D-,
+   * such as the STM32F723E-DISCO's ECMF02-4CMX8; on a board without one,
+   * the HS high level may exceed USB 2.0's VHSOH maximum of 440 mV (Table
+   * 7-7). Not measured. */
+  USBPHYC_TUNE |= PHYC_TUNE_VALUE;
   USBPHYC_PLL1 = PLL1_SEL(PHY_PLLSEL) | PLL1_EN;
   u2ps_dwc2_delay_us(2000u);
   return U2PS_DWC2_OK;

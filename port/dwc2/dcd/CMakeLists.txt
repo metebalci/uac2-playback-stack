@@ -7,8 +7,10 @@
 # U2PS_DWC2_FORCE_FS=ON makes the core enumerate at full speed only
 # (OTG_DCFG.DSPD = 01), for bench checks of full-speed behaviour.
 # U2PS_DWC2_OUT_FOLLOW=OFF starts the port with the data endpoint's parity
-# follow off (u2ps_dwc2_dcd_mode_t.out_follow), for an A/B check against
-# the parity guessed once at the open.
+# follow off (u2ps_dwc2_dcd_mode_t.out_follow), from the open and in a gap
+# of the host, for an A/B check: the parity guessed once at the open stays
+# until the first packet (release 0.1.0 had the follow from the open), and
+# the parity armed after a packet stays through a gap (as in 0.1.0).
 #
 # Test builds, never a release: U2PS_TEST_INJECT=ON builds the injection
 # hook (late re-arms on purpose, lost ACKs, the handler's pass profile;
@@ -30,7 +32,9 @@ if(CMAKE_CROSSCOMPILING)
   if(U2PS_DWC2_FORCE_FS)
     target_compile_definitions(u2ps_dwc2_dcd PRIVATE U2PS_DWC2_FORCE_FS=1)
   endif()
-  option(U2PS_DWC2_OUT_FOLLOW "DWC2 device port: the data parity follows the bus until a packet" ON)
+  option(U2PS_DWC2_OUT_FOLLOW
+         "DWC2 device port: the data parity follows the bus until a packet, from an open and in a gap"
+         ON)
   if(NOT U2PS_DWC2_OUT_FOLLOW)
     target_compile_definitions(u2ps_dwc2_dcd PRIVATE U2PS_DWC2_OUT_FOLLOW=0)
   endif()

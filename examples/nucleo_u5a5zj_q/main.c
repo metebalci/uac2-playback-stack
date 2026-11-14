@@ -119,9 +119,12 @@
  *     fb_flips=... fb_switches=... fb_polled=0|1 fb_first_q=...
  *     fb_first_odd=0|1 fb_first_after=<uframes> iiso_hist=8 values
  *     separated by '/' close_cycles=... close_max=... in_setups=...
- *     in_setup_ittxfe=... lost_ack=... b2bstup=...: the port's switches,
- *     its feedback start record, IISOIXFR by microframe, close times and
- *     EP0 counters (u2ps_dwc2_dcd.h)
+ *     in_setup_ittxfe=... lost_ack=... b2bstup=... out_gap_follows=...
+ *     incompisoout=... incompisoout_other=... out_gap_cleared=...
+ *     incomp_nak=... out_gap_own=... eonum_mismatch=...: the
+ *     port's switches, its feedback start record, IISOIXFR by microframe,
+ *     close times, EP0 counters and the data endpoint's gap follows and
+ *     INCOMPISOOUT indications (u2ps_dwc2_dcd.h)
  *   clock core_hz=... frames=... hs=0|1 system_core_clock=<Hz>, or clock
  *     error=no_sof: the core clock counted in DWT cycles over 1 s of the
  *     host's SOFs
@@ -141,7 +144,11 @@
  * In injection builds also: inject every=... us=... injected=... skipped=...
  * timeouts=... d_min_ns=... d_max_ns=..., to "inject <every> <us>|off";
  * ack every=..., to "ack <every>|off"; passes <kind>=<n>/<avg cycles>/<max
- * cycles> for each kind of pass, to "passes [clear]" (u2ps_dwc2_dcd.h).
+ * cycles> for each kind of pass, to "passes [clear]" (u2ps_dwc2_dcd.h;
+ * incomp, added in 0.1.1, last); and:
+ *   probe every=... probes=... nak_first=... nak_never=... nak_at_xfrc=...
+ *     timeouts=... nak_cycles_max=..., to "probe [<every>|off]": the
+ *     NAKSTS probe (u2ps_dwc2_dcd.h)
  *
  * Descriptions: a (at boot) has initial_sampling_frequency 0, so the
  * clock starts at rates[0], 44.1 kHz; b differs only in bcdDevice 0x0101
@@ -785,6 +792,13 @@ static void put_diag(line_t *l)
   put_kv(l, "in_setup_ittxfe", dg.in_setup_ittxfe);
   put_kv(l, "lost_ack", dg.lost_ack);
   put_kv(l, "b2bstup", dg.b2bstup);
+  put_kv(l, "out_gap_follows", dg.out_gap_follows);
+  put_kv(l, "incompisoout", dg.incompisoout);
+  put_kv(l, "incompisoout_other", dg.incompisoout_other);
+  put_kv(l, "out_gap_cleared", dg.out_gap_cleared);
+  put_kv(l, "incomp_nak", dg.incomp_nak);
+  put_kv(l, "out_gap_own", dg.out_gap_own);
+  put_kv(l, "eonum_mismatch", dg.eonum_mismatch);
 }
 
 #if U2PS_TEST_INJECT
@@ -805,12 +819,15 @@ static void put_inject(line_t *l)
 
 static void put_passes(line_t *l, bool clear)
 {
-  static const char *const names[U2PS_DWC2_PASS_KINDS] = {
-    "reset", "ep0_stop", "fb_flush", "setup", "out", "iiso", "eopf", "other"};
+  static const char *const names[U2PS_DWC2_PASS_KINDS] = U2PS_DWC2_PASS_NAMES;
   u2ps_dwc2_passes_t p;
   u2ps_dwc2_passes_get(&p, clear);
   put_str(l, "passes");
-  for (unsigned k = 0; k < U2PS_DWC2_PASS_KINDS; k++) {
+  /* In the kinds' order, but incomp, added in 0.1.1, last */
+  for (unsigned i = 0; i < U2PS_DWC2_PASS_KINDS; i++) {
+    unsigned k = i == U2PS_DWC2_PASS_KINDS - 1u ? U2PS_DWC2_PASS_INCOMP
+                 : i >= U2PS_DWC2_PASS_INCOMP   ? i + 1u
+                                                : i;
     put_str(l, " ");
     put_str(l, names[k]);
     put_str(l, "=");
@@ -1073,6 +1090,20 @@ static void mode_command(const char *p, line_t *l)
 }
 
 #if U2PS_TEST_INJECT
+static void put_probe(line_t *l)
+{
+  u2ps_dwc2_probe_t st;
+  u2ps_dwc2_probe_get(&st);
+  put_str(l, "probe");
+  put_kv(l, "every", st.every);
+  put_kv(l, "probes", st.probes);
+  put_kv(l, "nak_first", st.nak_first);
+  put_kv(l, "nak_never", st.nak_never);
+  put_kv(l, "nak_at_xfrc", st.nak_at_xfrc);
+  put_kv(l, "timeouts", st.timeouts);
+  put_kv(l, "nak_cycles_max", st.nak_cycles_max);
+}
+
 /* "inject <every> <us>", "inject off", "inject" */
 static void inject_command(const char *p, line_t *l)
 {
@@ -1520,12 +1551,23 @@ int main(void)
         char v[16];
         (void)word(rest, v, sizeof v);
         put_passes(&l, str_eq(v, "clear"));
+      } else if (str_eq(w, "probe")) {
+        char v[16];
+        uint32_t every = 0;
+        (void)word(rest, v, sizeof v);
+        if (v[0] == '\0' || str_eq(v, "off") || number(v, &every)) {
+          if (v[0] != '\0')
+            u2ps_dwc2_probe(every);
+          put_probe(&l);
+        } else {
+          put_str(&l, "error reason=arguments command=probe");
+        }
 #endif
       } else if (str_eq(cmd, "help")) {
         put_str(&l, "help commands=version,reconnect,disconnect,connect,reinit,speed,stats,vbus,"
                     "diag,clock,mode,fb,defer,canary,help");
 #if U2PS_TEST_INJECT
-        put_str(&l, ",inject,ack,passes");
+        put_str(&l, ",inject,ack,passes,probe");
 #endif
       } else {
         put_str(&l, "error reason=unknown_command");

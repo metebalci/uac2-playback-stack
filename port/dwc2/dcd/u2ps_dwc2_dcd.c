@@ -12,8 +12,8 @@
  *
  * Order of events in one pass of the handler:
  *  1. the stream's data endpoint (XFRC: complete, re-arm, then upcalls;
- *     EPDISD of a close), first, because its re-arm has the tightest
- *     deadline; OTG_DOEPINTx is read before OTG_DSTS;
+ *     EPDISD of a close; then INCOMPISOOUT), first, because its re-arm
+ *     has the tightest deadline; OTG_DOEPINTx is read before OTG_DSTS;
  *  2. USBRST (the port stops the stream itself, then on_reset), ENUMDNE
  *     (on_speed), WKUPINT (on_resume);
  *  3. the feedback endpoint (XFRC, then EPDISD; then EOPF, then IISOIXFR);
@@ -155,13 +155,13 @@ static struct {
 
 static void vec_mask(bool masked);
 
-/* The interrupts the port unmasks: these at init, and IISOIXFR, EOPF and
- * GONAKEFF while its stream needs them. Never CIDSCHG, which the STM32H7S3
+/* The interrupts the port unmasks: these at init, and IISOIXFR, EOPF,
+ * INCOMPISOOUT and GONAKEFF while its stream needs them. Never CIDSCHG, which the STM32H7S3
  * sets falsely after every reset (ES0596 2.21.2, p. 34). */
 #define GINT_INIT                                                                         \
   (GINT_USBRST | GINT_ENUMDNE | GINT_USBSUSP | GINT_WKUPINT | GINT_OEPINT | GINT_IEPINT | \
    GINT_ISOODRP | GINT_OTGINT | GINT_MMIS)
-#define GINT_STREAM (GINT_IISOIXFR | GINT_EOPF | GINT_GONAKEFF)
+#define GINT_STREAM (GINT_IISOIXFR | GINT_EOPF | GINT_INCOMPISOOUT | GINT_GONAKEFF)
 _Static_assert(((GINT_INIT | GINT_STREAM) & GINT_CIDSCHG) == 0u,
                "no interrupt mask the port writes may unmask CIDSCHG (ES0596 2.21.2)");
 
@@ -181,7 +181,20 @@ static void daintmsk_set(uint32_t v)
 }
 
 /* PRIMASK around the read of 'now' and the endpoint enable that depends on
- * it, so no interrupt comes between them; a few dozen instructions */
+ * it, so no interrupt comes between them; a few dozen instructions. The
+ * PC test of the handler (tests/test_dwc2_dcd.c, U2PS_DWC2_PC_TEST) has no
+ * interrupts. */
+#if defined(U2PS_DWC2_PC_TEST)
+static inline uint32_t irq_save(void)
+{
+  return 0;
+}
+
+static inline void irq_restore(uint32_t primask)
+{
+  (void)primask;
+}
+#elif defined(__arm__)
 static inline uint32_t irq_save(void)
 {
   uint32_t primask;
@@ -193,6 +206,9 @@ static inline void irq_restore(uint32_t primask)
 {
   __asm volatile("msr primask, %0" ::"r"(primask) : "memory");
 }
+#else
+#error "u2ps_dwc2_dcd.c: an Arm target is needed (or U2PS_DWC2_PC_TEST for its PC test)"
+#endif
 
 /* A bounded wait in the handler or at a reset, counted on its timeout */
 static bool wait(volatile uint32_t *reg, uint32_t mask, uint32_t value, uint32_t us)
@@ -712,6 +728,70 @@ void u2ps_dwc2_passes_get(u2ps_dwc2_passes_t *p, bool clear)
     passes = (u2ps_dwc2_passes_t){0};
   vec_mask(false);
 }
+
+/* The NAKSTS probe (u2ps_dwc2_dcd.h) */
+static struct {
+  volatile uint32_t every; /* 0: off */
+  uint32_t rearms;
+  u2ps_dwc2_probe_t st;
+} probe U2PS_FAST_BSS;
+
+/* After the re-arm: every probe.every-th time, poll OTG_DOEPCTLx until
+ * the next packet's completion clears EPENA, for at most two microframes */
+U2PS_FAST_TEXT static void probe_poll(void)
+{
+  if (probe.every == 0u || ++probe.rearms < probe.every)
+    return;
+  probe.rearms = 0;
+  uint32_t ctl = OTG_DOEPCTL(d.ep);
+  if ((ctl & EPCTL_EPENA) == 0u)
+    return; /* nothing armed */
+  probe.st.probes++;
+  uint32_t t0 = u2ps_dwc2_cycles(), t_nak = 0;
+  uint32_t limit = 250u * U2PS_DWC2_CYCLES_PER_US;
+  bool nak = false;
+  for (;;) {
+    ctl = OTG_DOEPCTL(d.ep);
+    uint32_t t = u2ps_dwc2_cycles();
+    if ((ctl & EPCTL_EPENA) == 0u) {
+      if (nak) {
+        probe.st.nak_first++;
+        if (t - t_nak > probe.st.nak_cycles_max)
+          probe.st.nak_cycles_max = t - t_nak;
+      } else {
+        probe.st.nak_never++;
+      }
+      if ((ctl & EPCTL_NAKSTS) != 0u)
+        probe.st.nak_at_xfrc++;
+      return;
+    }
+    if (!nak && (ctl & EPCTL_NAKSTS) != 0u) {
+      nak = true;
+      t_nak = t;
+    }
+    if (t - t0 > limit) {
+      probe.st.timeouts++;
+      return;
+    }
+  }
+}
+
+void u2ps_dwc2_probe(uint32_t every)
+{
+  vec_mask(true);
+  probe.every = 0;
+  probe.rearms = 0;
+  probe.st = (u2ps_dwc2_probe_t){.every = every};
+  probe.every = every;
+  vec_mask(false);
+}
+
+void u2ps_dwc2_probe_get(u2ps_dwc2_probe_t *st)
+{
+  vec_mask(true);
+  *st = probe.st;
+  vec_mask(false);
+}
 #endif
 
 /* n microframes of a hole for 'why', in on_missed calls of at most 65,535
@@ -754,6 +834,7 @@ U2PS_FAST_TEXT static void out_xfrc(void)
 #if U2PS_TEST_INJECT
   if (held)
     inject_done(t1);
+  probe_poll();
 #endif
   /* The feedback endpoint's IISOIXFR, unmasked in the microframes around
    * an expected poll; the data endpoint's completions are the clock */
@@ -928,27 +1009,36 @@ U2PS_FAST_TEXT static void fb_int(void)
 
 /* EOPF: while a parity follows the bus, the parity of the next
  * microframe goes to the enabled endpoint: the feedback endpoint's until
- * its first poll, the data endpoint's until its first packet, however late
- * they come (u2ps_dwc2_iso.h): one pass per microframe until then. Only
+ * its first poll, the data endpoint's until its first packet and, from a
+ * gap's start (out_incomplete), until the next, however late they come
+ * (u2ps_dwc2_iso.h): one pass per microframe until then. Only
  * SODDFRM or SEVNFRM acts: EPENA and EPDIS are of access type rs and SNAK
  * and CNAK of type w, so the zeros written to them change nothing (RM0456
- * 1.2, p. 127; 73.14.48, p. 3377, OTG_DIEPCTLx; 73.14.59, p. 3387,
+ * 1.2, p. 127; 73.14.48, p. 3377, OTG_DIEPCTLx; 73.14.59, p. 3389-3391,
  * OTG_DOEPCTLx of an isochronous endpoint); the characteristics are written
  * as they are. A data endpoint write that lands once its microframe has
- * begun is counted (out_follow_late). */
-U2PS_FAST_TEXT static void stream_eopf(void)
+ * begun is counted (out_follow_late). No data endpoint write while its
+ * NAKSTS is set: a packet has entered the Rx FIFO (RM0456 73.15.6,
+ * p. 3444, internal data flow 3) and is still to complete with the parity
+ * it was received in, which its P is taken with; nor while EPENA is clear,
+ * a completion pending, so that a core that set NAK only at the XFRC
+ * still writes nothing under a completed packet. Its XFRC ends the
+ * follow, and the first EOPF after it masks EOPF again.
+ * Nor in the pass whose INCOMPISOOUT started the follow (gap_start): that
+ * pass wrote the parity already, with its own FNSOF. */
+U2PS_FAST_TEXT static void stream_eopf(bool gap_start)
 {
   d.diag.eopf++;
   PASS_IS(U2PS_DWC2_PASS_EOPF);
   uint32_t fn = u2ps_dwc2_fnsof();
   bool odd;
-  if (d.eopf_out) {
-    if (u2ps_dwc2_out_eopf(&d.out, fn, &odd)) {
-      OTG_DOEPCTL(d.ep) = out_ctl() | parity_bits(odd);
-      u2ps_dwc2_out_eopf_after(&d.out, u2ps_dwc2_fnsof());
-    } else {
-      d.eopf_out = false;
-    }
+  if (d.eopf_out && !d.out.following) {
+    d.eopf_out = false; /* the follow ended at an XFRC */
+  } else if (d.eopf_out && !gap_start &&
+             (OTG_DOEPCTL(d.ep) & (EPCTL_EPENA | EPCTL_NAKSTS)) == EPCTL_EPENA &&
+             u2ps_dwc2_out_eopf(&d.out, fn, &odd)) {
+    OTG_DOEPCTL(d.ep) = out_ctl() | parity_bits(odd);
+    u2ps_dwc2_out_eopf_after(&d.out, u2ps_dwc2_fnsof());
   }
   if (d.eopf_fb) {
     if (d.fb_state == FB_ARMED && u2ps_dwc2_fb_eopf(&d.fb, fn)) {
@@ -959,6 +1049,44 @@ U2PS_FAST_TEXT static void stream_eopf(void)
     }
   }
   eopf_set(d.eopf_fb || d.eopf_out);
+}
+
+/* INCOMPISOOUT: evidence of a gap of the host (u2ps_dwc2_out_incomplete).
+ * Idle only if this pass served no XFRC of the data endpoint (its
+ * INCOMPISOOUT may be the packet's own, raised while it still completed)
+ * and OTG_DOEPCTLx, read once, has EPENA set (no completion: the core
+ * clears EPENA before it sets XFRC, RM0456 73.14.59, p. 3389) and NAKSTS
+ * clear (no packet received: the core sets the NAK as a packet enters the
+ * Rx FIFO, PKTCNT 1 to 0, RM0456 73.15.6, p. 3444, internal data flow 2
+ * and 3, and p. 3445, isochronous flow 1; in DMA mode on the STM32F723
+ * and the STM32U5G9 NAKSTS was seen 1 before every completion cleared
+ * EPENA, and that only the re-arm's CNAK clears it is inferred: see
+ * u2ps_dwc2_out_incomplete); then FNSOF, as RM0456 p. 3447 (application
+ * steps 3 and 4) asks. A pass that did not serve the XFRC but found EPENA
+ * and NAKSTS set counts in incomp_nak, and an EONUM other than the parity
+ * armed in eonum_mismatch. Once the gap is sure, the parity is written as at EOPF above, and
+ * the follow goes on at EOPF until the next XFRC, as from an open. Not
+ * RM0456 p. 3447 steps 5 and 6 (EPDIS, EPDISD, enable again): the armed
+ * buffer has received nothing, and only its parity changes. Returns true
+ * if it started the follow. */
+U2PS_FAST_TEXT static bool out_incomplete(bool served)
+{
+  d.diag.incompisoout++;
+  PASS_IS(U2PS_DWC2_PASS_INCOMP);
+  uint32_t ctl = OTG_DOEPCTL(d.ep);
+  bool idle = !served && (ctl & (EPCTL_EPENA | EPCTL_NAKSTS)) == EPCTL_EPENA;
+  if (!served && (ctl & (EPCTL_EPENA | EPCTL_NAKSTS)) == (EPCTL_EPENA | EPCTL_NAKSTS))
+    d.diag.incomp_nak++; /* a packet received, waiting for its DMA */
+  if ((ctl & EPCTL_EPENA) != 0u && ((ctl & EPCTL_EONUM) != 0u) != d.out.armed_odd)
+    d.diag.eonum_mismatch++;
+  bool odd;
+  if (!u2ps_dwc2_out_incomplete(&d.out, u2ps_dwc2_fnsof(), idle, &odd))
+    return false;
+  OTG_DOEPCTL(d.ep) = out_ctl() | parity_bits(odd);
+  u2ps_dwc2_out_eopf_after(&d.out, u2ps_dwc2_fnsof());
+  d.eopf_out = true;
+  eopf_set(true);
+  return true;
 }
 
 U2PS_FAST_TEXT void u2ps_dport_fb_set(uint32_t value)
@@ -1002,8 +1130,9 @@ bool u2ps_dport_stream_open(const u2ps_stream_t *s)
   d.close_out = d.close_fb = false;
 
   /* Data endpoint: activate, unmask, arm buffer 0 for parity(now + 1);
-   * the parity follows the bus at EOPF until the first packet, unless the
-   * follow is off (a bench comparison) */
+   * the parity follows the bus at EOPF until the first packet, and again
+   * from a gap's start that INCOMPISOOUT shows, unless the follow is off
+   * (a bench comparison) */
   OTG_DOEPCTL(d.ep) = out_ctl() | EPCTL_SNAK;
   OTG_DOEPINT(d.ep) = 0xFFFFFFFFu;
   daintmsk_set(d.daintmsk | DAINT_OEP(d.ep));
@@ -1050,6 +1179,10 @@ bool u2ps_dport_stream_open(const u2ps_stream_t *s)
     }
   }
   eopf_set(d.eopf_fb || d.eopf_out);
+  if (d.mode.out_follow) {
+    OTG_GINTSTS = GINT_INCOMPISOOUT; /* recorded while masked */
+    gintmsk_set(d.gintmsk | GINT_INCOMPISOOUT);
+  }
   d.open = true;
   return true;
 }
@@ -1086,7 +1219,7 @@ static void stream_end(void)
   out_tail_report();
   u2ps_dwc2_out_close(&d.out);
   u2ps_dwc2_fb_close(&d.fb);
-  gintmsk_set(d.gintmsk & ~(GINT_IISOIXFR | GINT_EOPF | GINT_GONAKEFF));
+  gintmsk_set(d.gintmsk & ~(GINT_IISOIXFR | GINT_EOPF | GINT_INCOMPISOOUT | GINT_GONAKEFF));
   d.iiso_on = d.eopf_on = d.eopf_fb = d.eopf_out = false;
   OTG_DOEPCTL(d.ep) = EPCTL_SNAK;
   OTG_DOEPINT(d.ep) = 0xFFFFFFFFu;
@@ -1113,7 +1246,7 @@ void u2ps_dport_stream_close(void)
   d.open = false;
   d.closing = true;
   u2ps_dwc2_out_closing(&d.out);
-  gintmsk_set(d.gintmsk & ~(GINT_IISOIXFR | GINT_EOPF));
+  gintmsk_set(d.gintmsk & ~(GINT_IISOIXFR | GINT_EOPF | GINT_INCOMPISOOUT));
   d.iiso_on = d.eopf_on = d.eopf_fb = d.eopf_out = false;
   d.close_t0 = u2ps_dwc2_cycles();
   /* SGONAK only with GONAKEFF clear (RM0456 73.14.39, p. 3367) */
@@ -1273,15 +1406,23 @@ U2PS_FAST_TEXT static void irq_pass(void)
   uint32_t daint = OTG_DAINT & d.daintmsk;
 
   /* 1. The data endpoint */
+  bool served = false;
   if (d.ep != 0u && (daint & DAINT_OEP(d.ep)) != 0u) {
     uint32_t i = OTG_DOEPINT(d.ep);
     OTG_DOEPINT(d.ep) = i;
-    if ((i & DOEPINT_XFRC) != 0u)
+    served = (i & DOEPINT_XFRC) != 0u;
+    if (served)
       out_xfrc();
     if ((i & DOEPINT_AHBERR) != 0u)
       d.diag.ahberr++;
     if ((i & DOEPINT_EPDISD) != 0u)
       out_epdisd();
+  }
+  bool gap_start = false;
+  if ((gint & GINT_INCOMPISOOUT) != 0u) {
+    OTG_GINTSTS = GINT_INCOMPISOOUT;
+    if (d.open)
+      gap_start = out_incomplete(served);
   }
   /* 2. Bus events */
   if ((gint & GINT_USBRST) != 0u) {
@@ -1307,7 +1448,7 @@ U2PS_FAST_TEXT static void irq_pass(void)
   if ((gint & GINT_EOPF) != 0u) {
     OTG_GINTSTS = GINT_EOPF;
     if (d.open)
-      stream_eopf();
+      stream_eopf(gap_start);
     else
       eopf_set(false);
   }
@@ -1434,9 +1575,9 @@ u2ps_dev_err_t u2ps_dport_init(void)
     return init_fail(U2PS_DWC2_ERR_FIFO);
 
   /* Interrupts: clear, then unmask. RXFLVL and NPTXFE stay masked in DMA
-   * mode (RM0456 p. 3437), INCOMPISOOUT too: the stream's misses come from
-   * the microframe numbers. EOPF and IISOIXFR are unmasked by the stream
-   * when its feedback endpoint needs them. */
+   * mode (RM0456 p. 3437). The stream's misses come from the microframe
+   * numbers; EOPF, IISOIXFR and INCOMPISOOUT are unmasked by the stream
+   * when its endpoints' parities need them. */
   OTG_GINTSTS = 0xFFFFFFFFu;
   gintmsk_set(GINT_INIT);
   d.daintmsk = OTG_DAINTMSK; /* its reset value, until the first bus reset writes it */
@@ -1522,6 +1663,10 @@ void u2ps_dwc2_dcd_diag(u2ps_dwc2_dcd_diag_t *diag)
   diag->close_drops = d.out.close_drops;
   diag->out_follows = d.out.follows;
   diag->out_follow_late = d.out.follow_late;
+  diag->out_gap_follows = d.out.gap_follows;
+  diag->incompisoout_other = d.out.incomp_other;
+  diag->out_gap_cleared = d.out.gap_cleared;
+  diag->out_gap_own = d.out.gap_own;
   diag->fb_idle_recoveries = d.fb.idle_recoveries;
   vec_mask(false);
 }

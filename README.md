@@ -40,13 +40,13 @@ microframe.
 
 ## Status
 
-This is release 0.1.0. There are two controller ports, DWC2 and ChipIdea;
+This is release 0.1.1. There are two controller ports, DWC2 and ChipIdea;
 one port is chosen at compile time. The targets are the STM32F723
 (Cortex-M7, DWC2), the STM32U5A5 (Cortex-M33, DWC2), the STM32H7S3
 (Cortex-M7, DWC2; host stack only, for now) and the i.MX RT1062
 (Cortex-M7, ChipIdea).
 
-| Part | State in 0.1.0 |
+| Part | State in 0.1.1 |
 |---|---|
 | Device stack, DWC2 device port | Runs on boards: the NUCLEO-U5A5ZJ-Q (below), and, in bit-perfect-checker's firmware, the STM32F723E-DISCO and the STM32U5G9J-DK2. |
 | Host stack, DWC2 host port | Tested on a PC only, against a fake host port and, through a bus that steps microframes, against the device stack. Not yet run on a board. |
@@ -111,6 +111,69 @@ The port interfaces and the app APIs of both stacks may change in any
 release before 1.0.0; the device side at least until the ChipIdea port has
 received a 768 kHz stream without a single changed sample.
 
+### Changes in 0.1.1
+
+- DWC2 device port: after a gap of the host in a stream, the host's first
+  packet was lost, without a signal, whenever it came in a microframe of
+  the other parity than the one armed after the last packet
+  (bit-perfect-checker measured it with u2ps 0.1.0, commit 488631e, on an
+  STM32F723 and an STM32U5G9 on 2026-11-12: 30 of 61 gaps of 20 to
+  200 ms). The data endpoint's parity now follows the bus in a gap of
+  three or more microframes; a gap of two needs no change. See "Example
+  app", and "Known limits" for what is still lost. bit-perfect-checker
+  measured the change on 2026-11-12 on its STM32F723E-DISCO and
+  STM32U5G9J-DK2, with a Linux host and its player, which does not poll
+  the feedback endpoint: no first packet lost after 20 gaps of 20 to
+  200 ms, 3 rate changes and 4 fresh opens on each board (0.1.0 lost 3 of
+  8 at 80 ms on the STM32F723); 12 of 12 streams at 705.6 and 768 kHz
+  bit-perfect on each, with no hole and the new counters at 0 (no
+  INCOMPISOOUT inside a stream); and the NAKSTS probe saw NAKSTS set
+  before EPENA cleared in every packet probed (4,800 at 192 kHz and 4,799
+  at 768 kHz, on each). On 2026-11-14 bit-perfect-checker repeated the
+  gap sweep and streams at 705.6 and 768 kHz with this release's code on
+  the NUCLEO-U5A5ZJ-Q, the STM32F723E-DISCO and the STM32U5G9J-DK2: no
+  first packet lost in 27 runs on each, and every stream bit-perfect. On
+  the PC the change is tested against a model of the core, and the port's
+  handler against a register model.
+- DWC2 device port, the cost in a pause: with the stream's alternate
+  setting kept and the host sending nothing, the follow in a gap runs the
+  handler once per microframe, 8,000 times a second. Measured with that
+  player, whose feedback endpoint is never polled, so that the feedback
+  endpoint's own follow keeps EOPF unmasked in both releases: 1.07 % of
+  the STM32F723's core and 1.33 % of the STM32U5G9's (0.1.0: 0.59 % and
+  0.77 %). With a host that polls the feedback endpoint, 0.1.0 runs no
+  pass in a pause, and 0.1.1, estimated from those figures and not
+  measured, about 1.07 % and 1.33 %. `-DU2PS_DWC2_OUT_FOLLOW=OFF` turns
+  the data endpoint's follows off, the one in a gap and the one from the
+  open, as before them; the feedback endpoint's follow, and its passes
+  while the host never polls, stay.
+- DWC2 device and host ports, STM32F723: the shared PHY start now writes
+  the HS PHY's tuning register, USBPHYC_TUNE (RM0431 33.4.2), with 0xF13
+  OR-ed into its reset value, 0x4, so 0xF17: a current boost of 2 mA,
+  the HS driver's DC level down by 5 to 7 mV, rise and fall time +20 %,
+  and the HS driver current +10.92 % for a common-mode choke on D+ and
+  D-, such as the STM32F723E-DISCO's ECMF02-4CMX8. Release 0.1.0 left it
+  at its reset value. On a board without such a choke, the HS high level
+  may exceed USB 2.0's VHSOH maximum of 440 mV (Table 7-7); not measured.
+  Tested on a PC against a register model. On a board, bit-perfect-checker
+  measured on 2026-11-14 on its STM32F723E-DISCO: the register reads back
+  0xF17, the board enumerates at High-Speed after every flash, and the gap
+  sweep (no first packet lost in 27 runs) and continuous streams at 705.6
+  and 768 kHz (bit-perfect) pass with it. Its effect on marginal cables
+  and on the HS signal levels is not measured.
+- `u2ps_dwc2_dcd_diag_t` has seven counters more at its end:
+  `incompisoout`, `out_gap_follows`, `incompisoout_other`,
+  `out_gap_cleared`, `incomp_nak`, `out_gap_own` and `eonum_mismatch`.
+  `out_follow_late` counts also late or skipped passes of a follow and gap
+  evidence not two microframes apart. The injection build's pass profile
+  has the kind `U2PS_DWC2_PASS_INCOMP` before `U2PS_DWC2_PASS_OTHER`, so
+  `U2PS_DWC2_PASS_KINDS` is 9; `U2PS_DWC2_PASS_NAMES` names the kinds.
+  `u2ps_dwc2_out_t` (`u2ps_dwc2_iso.h`) has new fields. Rebuild everything
+  that includes `u2ps_dwc2_dcd.h` or `u2ps_dwc2_iso.h`.
+- The example's `diag` line has these seven counters at its end, and its
+  `passes` line `incomp` at its end. The injection build has the NAKSTS
+  probe (`u2ps_dwc2_probe()`, the example's `probe` command).
+
 ## Deviations and known limits
 
 Every deviation from USB 2.0 and UAC2 but one is a build option, off by
@@ -134,7 +197,78 @@ Request Error (9.4.1). It is tolerated for hosts that clear the halt of
 every endpoint; USB3CV's Chapter 9 tests do not test it on isochronous
 endpoints. It is to become a STALL in a later release.
 
-Known limits of 0.1.0:
+Known limits of 0.1.1:
+
+- DWC2 device port, as in 0.1.0: after a single microframe without a
+  packet, the host's next packet is lost, and the hole is one microframe
+  longer than the host's gap; after a packet the core drops for a CRC
+  error, the next packet is lost too, so two microframes in which the
+  host sent are missing; after a re-arm that comes after the token of its
+  microframe, that packet and the next are lost. The port follows a gap
+  only after two INCOMPISOOUT of the armed parity (see "Example app").
+- DWC2 device port, as in 0.1.0: a completion served two or more
+  microframes late is stamped P + 2, or P + 2k when served 2k or 2k + 1
+  microframes late, and its hole is placed one packet early
+  (`port/dwc2/u2ps_dport_cfg.h`, `U2PS_DPORT_UFRAME_EXACT`).
+- DWC2 device port: the follow in a gap needs each of its passes served,
+  and its parity write complete, before the next SOF, 6.25 us after the
+  EOPF point. A pass served after the next SOF, while the handler was held
+  by an interrupt of a higher priority or a masked section, costs packets:
+  - A late first INCOMPISOOUT of a gap delays the follow by two
+    microframes, and a host that resumes in the gap's fourth microframe
+    loses that packet. One microframe late, it counts in
+    `incompisoout_other`; two microframes late, in no counter.
+  - An EOPF pass of a follow more than one microframe after the last
+    writes nothing and counts in `out_follow_late`. An EOPF pass served
+    after the next SOF right after such a pass is taken for a timely one
+    and writes a parity before or under the host's packet of its
+    microframe: lost, or stamped a microframe early and the next one lost.
+    While the handler is served a microframe late in every microframe,
+    the host's packets can be lost in all of them; 0.1.0, without a
+    follow in a gap, does not lose them so.
+  - Two INCOMPISOOUT of a gap's start, each served two microframes late,
+    start the follow early in a microframe, with the same loss.
+  - An open that unmasks EOPF an odd number of microframes, three or
+    more, after its arm loses the host's first packet in the microframe
+    after the first EOPF pass.
+  `out_follow_late` counts most of these (the register test's
+  `test_late_passes`, `tests/test_dwc2_dcd.c`), but not every one. A later
+  release may detect such passes.
+- DWC2 device port: measured on the STM32F723 and the STM32U5G9 with a
+  Linux host on 2026-11-12, with the NAKSTS probe of the injection build
+  (below): NAKSTS was seen set before EPENA cleared in every packet
+  probed, 4,800 at 192 kHz and 4,799 at 768 kHz on each. The port's gap
+  evidence relies on it (RM0456 73.15.6, p. 3444, internal data flow 3).
+  Not measured: other DWC2 cores. On a core that set NAK only at the
+  XFRC, or never, a miss followed by a packet completing late, and a late
+  first packet after a gap, would lose one packet more than 0.1.0
+  (`tests/test_dwc2_dcd.c`, `test_models`); run the probe on a new core.
+- DWC2 device port, a packet on the wire at the EOPF point. Derived from
+  the probe's lead of NAKSTS over the completion, which grows with the
+  packet's size: NAK comes at the end of a packet's reception, so NAKSTS
+  reads 0 while a packet is on the wire, up to about 17 us; and the
+  packets measured to complete 117 to 121 us into their microframe
+  entered the Rx FIFO about 115 to 120 us into it, some after the EOPF
+  point (118.75 us). Not measured: whether a packet of a microframe is on
+  the wire at its EOPF point, where every follow write reads NAKSTS.
+  RM0456 73.15.6 (p. 3446-3447) says only that at INCOMPISOOUT no transfer
+  remains in progress on the endpoint, and USB 2.0 lets a host send that
+  late (11.2.5). A parity written while a packet is on the wire lands
+  under it: stamped a microframe off, and the next packet lost.
+  `out_gap_own` counts such a packet only when it is a gap's first
+  INCOMPISOOUT; a capture of the late packets on the bus would show
+  whether it happens.
+- DWC2 device and host ports, STM32F723: the HS PHY's tuning
+  (USBPHYC_TUNE 0xF17, see "Changes in 0.1.1") raises the HS driver
+  current by 10.92 % for a common-mode choke on D+ and D-, such as the
+  STM32F723E-DISCO's ECMF02-4CMX8. On a board without one, the HS high
+  level may exceed USB 2.0's VHSOH maximum of 440 mV (Table 7-7). Not
+  measured on either kind of board.
+- Device stack, as in 0.1.0: `uframe_back` counts one packet after a host
+  gap whose length, taken modulo the 14-bit microframe numbers (2.048 s),
+  places the packet's microframe not after the last one's;
+  bit-perfect-checker saw it rise by 1 after each 10 s gap. A counter
+  quirk: the packet is delivered and the gap reported.
 
 - DWC2 device port: nothing bounds the EP0 OUT DMA while SETUP packets
   come back to back. RM0456 73.14.55 allows any number of them before the
@@ -263,10 +397,12 @@ The PC build uses the host compiler. It builds the common, device and host
 libraries of the stacks it selects, the test kit and the tests, all with
 AddressSanitizer and UndefinedBehaviorSanitizer. The tests of u2ps need
 both stacks; a build of one stack builds and runs that stack's tests only.
-Of the ports it builds only the decision logic of the DWC2 and ChipIdea
+Of the ports it builds the decision logic of the DWC2 and ChipIdea
 device ports and of the DWC2 host port, which has no register access, and
 the DWC2 chip facts and start-up values; the tests use the test kit's fake
-ports. `test_dwc2_phy_*` runs the DWC2 start-up's register code
+ports. `test_dwc2_dcd` runs the DWC2 device port's handler
+(`port/dwc2/dcd/u2ps_dwc2_dcd.c`, built for the STM32U5A5) against a
+register model, and `test_dwc2_phy_*` the DWC2 start-up's register code
 (`port/dwc2/common/u2ps_dwc2_phy.c`) against a register model, and
 `test_dwc2_chip_unknown` and `test_dwc2_chip_two` check that a DWC2 build
 with an unknown chip, or with two chips, stops at the chip header's
@@ -457,7 +593,7 @@ example's `stream_stats` lines:
 | ATfE 23.1.0, `-Oz` | 733 / 759 | 4.20 % |
 | GCC 14.2, `-O2` (the default) | 624 / 638 | 3.60 % |
 
-Code size: measured on 2026-11-11 from the 0.1.0 tree, no board involved.
+Code size: measured on 2026-11-14 from the 0.1.1 tree, no board involved.
 The `stm32u5a5` build of the device stack alone (`-DU2PS_DEVICE=ON
 -DU2PS_VBUS=app -DU2PS_EXAMPLES=ON`, `RelWithDebInfo`, `U2PS_LTO=OFF`, no
 injection hook); the library text is the sum of the text of
@@ -468,10 +604,10 @@ ELF:
 
 | Compiler and option | Text of the three libraries | Text of the example app |
 |---|---|---|
-| ATfE 23.1.0, `-O2` | 20,880 bytes | 95,364 bytes |
-| ATfE 23.1.0, `-Os` (the default) | 17,516 bytes | 33,148 bytes |
-| ATfE 23.1.0, `-Oz` | 15,578 bytes | 25,452 bytes |
-| GCC 14.2, `-O2` (the default) | 17,009 bytes | 35,148 bytes |
+| ATfE 23.1.0, `-O2` | 21,572 bytes | 100,912 bytes |
+| ATfE 23.1.0, `-Os` (the default) | 18,192 bytes | 34,020 bytes |
+| ATfE 23.1.0, `-Oz` | 16,204 bytes | 26,268 bytes |
+| GCC 14.2, `-O2` (the default) | 17,677 bytes | 36,028 bytes |
 
 ### DMA memory
 
@@ -543,13 +679,12 @@ stack's state, zero-initialised (`U2PS_FAST_BSS`). Both survive LTO. A
 linker script without a rule for them takes them with its
 `*(.text .text.*)` and `*(.bss .bss.*)` rules, as the example's does: the
 STM32U5 has no TCM for them to go to. On the STM32F723 they take, in a
-link of the device stack from the 0.1.0 tree (`AGENTS.md` describes the
-link; measured on 2026-11-11), built with ATfE (`-Os`), 4,284 bytes of ITCM
-(4,124 bytes of code and 160 bytes of linker veneers for the calls to
-flash) and 508 bytes of DTCM, 4,428 and 508 bytes with `U2PS_LTO=ON`;
-built with GCC (`-O2`),
-4,432 (128 of them veneers) and 472 bytes, 4,656 and 472 bytes with
-`U2PS_LTO=ON`. `AGENTS.md` gives the rules.
+link of the device stack from the 0.1.1 tree (`AGENTS.md` describes the
+link; measured on 2026-11-14), built with ATfE (`-Os`), 4,892 bytes of ITCM
+(4,732 bytes of code and 160 bytes of linker veneers for the calls to
+flash) and 556 bytes of DTCM, 4,964 and 556 bytes with `U2PS_LTO=ON`;
+built with GCC (`-O2`), 5,056 (128 of them veneers) and 520 bytes, 5,320
+and 520 bytes with `U2PS_LTO=ON`. `AGENTS.md` gives the rules.
 Rare events (bus reset, EP0, the close, the feedback's recovery) stay out
 of line and out of these sections.
 
@@ -759,16 +894,72 @@ until its first packet and the feedback endpoint's until its first poll,
 with no time limit: Linux polls the feedback endpoint up to about 240 ms
 after SET_INTERFACE at high rates. The follow costs one EOPF pass of the
 handler per microframe until then, and for the whole stream if the host
-never polls the feedback endpoint. The cycles of that pass are still to
-be measured (`eopf` in the `passes` line of an injection build, below).
+never polls the feedback endpoint (`eopf` in the `passes` line of an
+injection build, below; measured in a gap's follow below).
+After the first packet, the data endpoint's parity follows the bus again
+in a gap of the host of three or more microframes, from the gap's third
+microframe to the next packet, so that the host's first packet after the
+gap is received in a microframe of either parity; after a gap of exactly
+two the next microframe of the armed parity is the host's, and nothing is
+written. The core raises INCOMPISOOUT at the end of a microframe in which
+the endpoint completed no transfer (RM0456 73.15.6, "Incomplete
+isochronous OUT data transfers"; RM0431 32.16.6), but also for a packet
+whose data is still being written to memory then: measured at 705.6 and
+768 kHz, 0.01 to 0.03 % of the packets complete 117 to 121 us into their
+microframe, around the EOPF point at 95 % (118.75 us); with NAK at the end
+of reception (below) about 1.3 to 1.8 us before the completion, these
+packets entered the Rx FIFO about 115 to 120 us into the microframe. So
+the port takes an INCOMPISOOUT as evidence of a gap only if the endpoint
+is enabled and its NAKSTS is clear (the core sets the NAK when the packet
+count reaches 0, as a packet enters the Rx FIFO, RM0456 73.15.6, p. 3444;
+in DMA mode on the STM32F723 and the STM32U5G9, the probe below saw
+NAKSTS 1 before every completion) and no completion was served in the
+same pass, and it takes the gap as sure only after two such INCOMPISOOUT
+of the armed parity, two microframes apart, with no packet between. The
+follow then runs at EOPF until the next packet, as from an open; it
+changes no parity while NAKSTS is set or EPENA is clear, nor in a pass
+that comes more than one microframe after the last. Release 0.1.0 kept
+the parity armed after the last packet through a gap and lost the host's
+first packet after it, without a signal, whenever the host resumed in a
+microframe of the other parity. What is still lost is in "Known limits".
+Handler passes that this costs, while the stream is open: in a gap, one
+at the first missing microframe, one at the third, one per microframe
+from the fourth to the next packet (8,000 a second, each pass serving
+EOPF and INCOMPISOOUT together, profiled as `eopf`) and one at the EOPF
+after that packet, which ends the follow; while the host streams, a
+packet that completes past the EOPF point raises one INCOMPISOOUT, served
+in a pass of its own (profiled as `incomp`) or with the packet's
+completion (profiled as `out`). For the follow to keep up, each pass
+must be served, and its parity write complete, within the 6.25 us from
+the EOPF point to the next SOF; `out_follow_late` counts most passes that
+were not ("Known limits"). The example's `diag` line ends with the
+counters (`out_gap_follows`, `incompisoout`, `incompisoout_other`,
+`out_gap_cleared`, `incomp_nak`, `out_gap_own`, `eonum_mismatch`;
+`u2ps_dwc2_dcd.h` says what each counts). Measured by
+bit-perfect-checker on 2026-11-12 on its
+STM32F723E-DISCO and STM32U5G9J-DK2, with its player, which does not poll
+the feedback endpoint, so that the feedback endpoint's follow kept EOPF
+unmasked for the whole stream in both releases: in a 10 s gap with the
+alternate setting kept, the port's passes took 1.07 % and 1.33 % of the
+core (0.1.0, that follow alone: 0.59 % and 0.77 %), an EOPF pass 288 and
+266 cycles (0.1.0: 159 and 154); while streaming, 3.40 % and 4.08 %
+(0.1.0: 3.18 % and 3.90 %), and the OUT pass 745 and 658 cycles (0.1.0:
+700 and 625), in the injection build. With a host that polls the
+feedback endpoint, 0.1.0 runs no pass in a pause, and 0.1.1 the 8,000 a
+second of the follow in a gap; estimated from the figures above, not
+measured, about 1.07 % and 1.33 %. A later release may mask INCOMPISOOUT
+during a follow to make that pass cheaper.
 
 Options of the DWC2 port for bench checks: `-DU2PS_DWC2_FORCE_FS=ON` makes
 the device enumerate at full speed only; `-DU2PS_DWC2_OUT_FOLLOW=OFF`
 starts with the data endpoint's parity follow off, so that the parity
 guessed at a stream's open stays until the first packet, as before the
-follow (the example's `mode out 0|1` switches it at run time, and `diag`
-shows `out_follows` and `out_follow_late`, the follow writes that landed
-too late); and `U2PS_DWC2_HSE_HZ` (default
+follow, and the parity armed after a packet stays through a gap, as in
+release 0.1.0 (the example's `mode out 0|1` switches it at run time, and
+`diag` shows `out_follows` and `out_gap_follows`, and `out_follow_late`:
+follow writes that landed too late, EOPF passes of a follow that came
+late or were skipped, and gap evidence that was not two microframes
+apart, each a packet that may have been lost); and `U2PS_DWC2_HSE_HZ` (default
 16000000 for the STM32U5, 25000000 for the STM32F723, 24000000 for the
 STM32H7S3) gives the HSE frequency that the USB PHY takes its reference
 from. `U2PS_DWC2_CORE_HZ` (default 160000000 for the STM32U5, 216000000
@@ -783,9 +974,13 @@ Test builds, never a release: `-DU2PS_TEST_INJECT=ON` builds the
 injection hook, with the example's commands `inject <every> <us>` (every
 nth re-arm of the stream that would be in time is held until the next
 microframe plus that many microseconds), `ack <every>` (a lost ACK on
-every nth control read) and `passes` (the handler's time by kind of
-pass). `-DU2PS_TEST_OLD_RULE=ON`, only with it, arms the stream by the
-rule before B-next, for the comparison. `-DU2PS_EXAMPLE_STALL=ON` builds
+every nth control read), `passes` (the handler's time by kind of
+pass) and `probe <every>` (the NAKSTS probe: after every nth re-arm of the
+stream the handler polls the data endpoint until the next packet
+completes, within a budget of DWT cycles that is 250 us at the build's
+`U2PS_DWC2_CORE_HZ`, and counts whether NAKSTS was seen set before EPENA
+cleared; `u2ps_dwc2_dcd.h`). `-DU2PS_TEST_OLD_RULE=ON`, only with it,
+arms the stream by the rule before B-next, for the comparison. `-DU2PS_EXAMPLE_STALL=ON` builds
 the stall mode (`examples/nucleo_u5a5zj_q/app_stall.h`): in the last
 second of every 3 s of a stream the app holds every packet it may hold,
 count - `U2PS_DPORT_ISO_OUT_RESERVE`, and then releases them all, so each
